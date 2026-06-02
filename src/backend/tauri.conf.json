@@ -1,0 +1,29 @@
+{
+  "productName": "antigravity",
+  "version": "0.1.0",
+  "identifier": "com.antigravity.workspace",
+  "build": {
+    "beforeBuildCommand": "npm run --prefix ../.. type-check",
+    "beforeDevCommand": "npm run --prefix ../.. dev",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "Antigravity Workspace",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 400,
+        "minHeight": 300,
+        "resizable": true,
+        "fullscreen": false,
+        "focus": true
+      }
+    ]
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

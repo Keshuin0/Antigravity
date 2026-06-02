@@ -1,38 +1,31 @@
-name: Frontend UI CI 
-on: 
-  push: 
-    branches: [main, dev] 
-  pull_request: 
-    branches: [main, dev] 
-jobs: 
-  build-check: 
-    runs-on: ubuntu-latest 
-    steps: 
-      - uses: actions/checkout@v4 
-      - name: Set up Node.js 
-        uses: actions/setup-node@v4 
-        with: 
-          node-version: 20 
-      - name: Install Dependencies 
+name: Frontend UI CI
 
-added 431 packages, and audited 432 packages in 56s
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
 
-157 packages are looking for funding
-  run `npm fund` for details
+jobs:
+  build-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-12 vulnerabilities (3 moderate, 6 high, 3 critical)
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
 
-To address issues that do not require attention, run:
-  npm audit fix
+      - name: Install Dependencies
+        run: npm ci
 
-To address all issues (including breaking changes), run:
-  npm audit fix --force
+      - name: Verify Lint and Types
+        run: |
+          npm run lint
+          npm run type-check
 
-Run `npm audit` for details.
-      - name: Verify Compiles 
-
-> antigravity-workspace@0.1.0 build
-> vite build
-
-[36mvite v6.4.3 [32mbuilding for production...[36m[39m
-[32m✓[39m 0 modules transformed.
+      - name: Verify Compiles
+        run: npm run build
