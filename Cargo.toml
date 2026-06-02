@@ -1,0 +1,139 @@
+[package]
+name = "antigravity"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+authors = ["Antigravity Engine Development Team"]
+description = "Autonomous workspace engine with intelligent code synthesis and self-healing development loops"
+repository = "https://github.com/Keshuin0/antigravity-workspace"
+license = "Proprietary"
+
+[lib]
+path = "src/backend/lib.rs"
+
+[[bin]]
+name = "antigravity"
+path = "src/backend/main.rs"
+
+# ==============================================================================
+# CORE DEPENDENCIES
+# ==============================================================================
+[dependencies]
+# Web Framework & HTTP
+tauri = { version = "2.0", features = ["shell-open", "fs-read-file", "fs-write-file", "fs-all"] }
+tauri-build = "2.0"
+tokio = { version = "1.35", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls"] }
+hyper = { version = "1.0", features = ["full"] }
+
+# Async & Concurrency
+futures = "0.3"
+async-trait = "0.1"
+tokio-stream = "0.1"
+crossbeam-channel = "0.5"
+
+# Serialization & Data
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+bincode = "1.3"
+
+# Database
+rusqlite = { version = "0.30", features = ["bundled", "chrono", "uuid"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono", "json"] }
+sqlite-vec = "0.1"
+
+# Parser & AST
+tree-sitter = "0.24"
+tree-sitter-rust = "0.21"
+tree-sitter-typescript = "0.21"
+
+# Code Analysis
+regex = "1.10"
+similar = "2.2"
+
+# Security & Credentials
+keyring = "2.0"
+secrecy = "0.8"
+zeroize = "1.7"
+sha2 = "0.10"
+base64 = "0.21"
+
+# Logging & Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "ansi"] }
+log = "0.4"
+
+# File System Watching
+notify = "6.0"
+notify-debounce-mini = "0.2"
+
+# Git Integration
+git2 = "0.29"
+
+# Process Management
+nix = { version = "0.27", features = ["process"] }
+anyhow = "1.0"
+thiserror = "1.0"
+
+# Utility
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+lazy_static = "1.4"
+once_cell = "1.19"
+
+# Zero-Copy Utilities
+zerocopy = "0.4"
+
+# Testing
+[dev-dependencies]
+tokio-test = "0.4"
+mockall = "0.12"
+tempfile = "3.8"
+criterion = "0.5"
+
+[[bench]]
+name = "vector_search"
+harness = false
+
+[[bench]]
+name = "ast_parsing"
+harness = false
+
+# ==============================================================================
+# BUILD CONFIGURATION
+# ==============================================================================
+[profile.dev]
+opt-level = 1
+debug = true
+split-debuginfo = "packed"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+# ==============================================================================
+# FEATURES
+# ==============================================================================
+[features]
+default = ["ai-streaming", "git-automation", "vector-indexing"]
+ai-streaming = []
+git-automation = []
+vector-indexing = []
+self-healing = []
+sandboxing = []
+full = ["ai-streaming", "git-automation", "vector-indexing", "self-healing", "sandboxing"]
+
+# ==============================================================================
+# WORKSPACE (For monorepo structure)
+# ==============================================================================
+[workspace]
+members = ["src/backend", "src/frontend", "src/shared"]
+resolver = "2"
