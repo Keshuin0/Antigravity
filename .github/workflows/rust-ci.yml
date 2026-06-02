@@ -1,7 +1,19 @@
 name: Rust Backend CI 
-on: [push, pull_request] 
+on: 
+  push: 
+    branches: [main, dev] 
+  pull_request: 
+    branches: [main, dev] 
 jobs: 
-  build: 
+  validate: 
     runs-on: ubuntu-latest 
     steps: 
       - uses: actions/checkout@v4 
+      - name: Install Stable Toolchain 
+        uses: dtolnay/rust-toolchain@stable 
+        with: 
+          components: clippy, rustfmt 
+      - name: Verify Code Formatting 
+        run: cargo fmt --manifest-path src/backend/Cargo.toml -- --check 
+      - name: Run Clippy Lints 
+        run: cargo clippy --manifest-path src/backend/Cargo.toml --all-targets -- -D warnings 
