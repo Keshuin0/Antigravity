@@ -5,6 +5,7 @@ import path from 'path';
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react()],
+  root: 'src/frontend',
   
   resolve: {
     alias: {
@@ -29,23 +30,5 @@ export default defineConfig({
   
   build: {
     target: 'ES2020',
-    minify: 'terser',
-    terserOptions: {
-      compress: {
-        drop_console: true,
-        drop_debugger: true,
-      },
-    },
-    rollupOptions: {
-      output: {
-        manualChunks: {
-          'vendor-react': ['react', 'react-dom'],
-          'vendor-ui': ['@monaco-editor/react', 'monaco-editor'],
-          'vendor-routing': ['react-router-dom'],
-          'vendor-forms': ['react-hook-form', '@hookform/resolvers'],
-          'vendor-state': ['zustand'],
-        },
-      },
-    },
   },
 });
