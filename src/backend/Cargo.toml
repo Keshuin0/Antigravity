@@ -2,12 +2,15 @@
 name = "antigravity-kernel" 
 version = "0.1.0" 
 edition = "2021" 
- 
+
 [dependencies] 
 tauri = { version = "2.0.0", features = [] } 
 tokio = { version = "1.35", features = ["full"] } # [cite: 47] 
+serde = { version = "1.0", features = ["derive"] }
 notify = "6.0" # [cite: 126] 
 tree-sitter = "0.24" # [cite: 139] 
+tree-sitter-rust = "0.21.0"
+tree-sitter-typescript = "0.21.0"
 rusqlite = "0.30" # [cite: 163] 
 zerocopy = "0.4" # [cite: 166] 
 keyring = "2.0" # [cite: 97] 
@@ -16,3 +19,4 @@ git2 = "0.21.0" # [cite: 195]
 
 [build-dependencies]
 tauri-build = "2.0.0"
+

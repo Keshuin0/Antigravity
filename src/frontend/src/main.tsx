@@ -1,13 +1,33 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import './index.css';
 
 interface LogEntry {
   id: string;
   time: string;
-  type: 'info' | 'success' | 'warn' | 'error' | 'gemini';
+  type: 'info' | 'success' | 'warn' | 'error' | 'gemini' | 'watcher';
   message: string;
+}
+
+interface FileChangeEvent {
+  path: string;
+  kind: string;
+  symbols_count: number;
+}
+
+interface ASTSymbol {
+  name: string;
+  kind: string;
+  start_line: number;
+  end_line: number;
+  signature: string | null;
+}
+
+interface FileSymbols {
+  path: string;
+  symbols: ASTSymbol[];
 }
 
 // Detect if running inside the Tauri WebView environment
@@ -21,6 +41,9 @@ const App: React.FC = () => {
   const [apiToken, setApiToken] = useState<string>('••••••••••••••••••••••••');
   const [commandInput, setCommandInput] = useState<string>('cargo build --release');
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [fileChanges, setFileChanges] = useState<FileChangeEvent[]>([]);
+  const [symbolIndex, setSymbolIndex] = useState<FileSymbols[]>([]);
+  const [watcherActive, setWatcherActive] = useState(false);
 
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -69,6 +92,17 @@ const App: React.FC = () => {
     }
   };
 
+  // Load symbol index from backend
+  const loadSymbols = async () => {
+    if (!isTauri) return;
+    try {
+      const result = await invoke<FileSymbols[]>('get_symbols');
+      setSymbolIndex(result);
+    } catch (_) {
+      // Symbols may not be populated yet
+    }
+  };
+
   useEffect(() => {
     loadBackendLogs();
 
@@ -81,6 +115,28 @@ const App: React.FC = () => {
         .catch((err) => {
           addLog('error', `Tauri Bridge Ping Failed: ${err}`);
         });
+
+      // Load initial symbols
+      loadSymbols();
+
+      // Listen for real-time file change events from the watcher
+      let unlisten: (() => void) | null = null;
+      listen<FileChangeEvent>('file-change', (event) => {
+        const payload = event.payload;
+        setFileChanges((prev) => [payload, ...prev].slice(0, 100));
+        setWatcherActive(true);
+        const time = new Date().toTimeString().split(' ')[0] || '';
+        setLogs((prev) => [...prev, {
+          id: Math.random().toString(),
+          time,
+          type: 'watcher' as const,
+          message: `[${payload.kind.toUpperCase()}] ${payload.path} (${payload.symbols_count} symbols)`,
+        }]);
+        // Refresh symbols on changes
+        loadSymbols();
+      }).then((fn) => { unlisten = fn; });
+
+      return () => { if (unlisten) unlisten(); };
     }
   }, []);
 
@@ -233,11 +289,15 @@ const App: React.FC = () => {
             <div className="flex items-center space-x-8 font-mono">
               <div className="text-right">
                 <span className="text-[10px] text-white/40 uppercase block">AST Mapped</span>
-                <span className="text-sm font-semibold text-white">42 Files</span>
+                <span className="text-sm font-semibold text-white">{symbolIndex.length || '—'} Files</span>
               </div>
               <div className="text-right">
-                <span className="text-[10px] text-white/40 uppercase block">Local DB</span>
-                <span className="text-sm font-semibold text-white">287 Nodes</span>
+                <span className="text-[10px] text-white/40 uppercase block">Symbols</span>
+                <span className="text-sm font-semibold text-white">{symbolIndex.reduce((acc, f) => acc + f.symbols.length, 0) || '—'}</span>
+              </div>
+              <div className="text-right">
+                <span className="text-[10px] text-white/40 uppercase block">Watcher</span>
+                <span className={`text-sm font-semibold ${watcherActive ? 'text-emerald-400' : 'text-amber-400'}`}>{watcherActive ? 'Active' : 'Idle'}</span>
               </div>
               <div className="text-right">
                 <span className="text-[10px] text-white/40 uppercase block">Embeddings</span>
@@ -339,6 +399,70 @@ const App: React.FC = () => {
                     </div>
                   </div>
                 </div>
+
+                {/* Live File Watcher Activity */}
+                <div className="glass-panel p-6 rounded-xl space-y-4">
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-white">Live File Watcher Activity</h3>
+                    <div className="flex items-center space-x-2">
+                      <span className={`w-2 h-2 rounded-full ${watcherActive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                      <span className="text-[10px] font-mono text-white/50">{watcherActive ? 'Watching' : 'Idle'}</span>
+                    </div>
+                  </div>
+                  {fileChanges.length === 0 ? (
+                    <p className="text-xs text-white/30 text-center py-6">No file changes detected yet. Edit a file in the workspace to see events here.</p>
+                  ) : (
+                    <div className="max-h-[200px] overflow-y-auto space-y-2">
+                      {fileChanges.slice(0, 20).map((fc, i) => (
+                        <div key={i} className="flex items-center justify-between px-3 py-2 bg-black/20 border border-white/5 rounded-lg">
+                          <div className="flex items-center space-x-2 min-w-0">
+                            <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${fc.kind === 'modify' ? 'bg-violet-500' : 'bg-rose-500'}`} />
+                            <span className="text-[11px] text-white/70 font-mono truncate">{fc.path}</span>
+                          </div>
+                          <span className="text-[10px] text-white/30 font-mono flex-shrink-0 ml-2">{fc.symbols_count} sym</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Symbol Index Table */}
+                {symbolIndex.length > 0 && (
+                  <div className="glass-panel p-6 rounded-xl space-y-4">
+                    <h3 className="text-sm font-semibold text-white">AST Symbol Index (Cached)</h3>
+                    <div className="max-h-[250px] overflow-y-auto">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-white/5 bg-white/5 font-mono uppercase text-white/40 sticky top-0">
+                            <th className="p-3">File</th>
+                            <th className="p-3">Symbol</th>
+                            <th className="p-3">Kind</th>
+                            <th className="p-3">Lines</th>
+                          </tr>
+                        </thead>
+                        <tbody className="font-mono text-white/70">
+                          {symbolIndex.flatMap((file) =>
+                            file.symbols.map((sym, j) => (
+                              <tr key={`${file.path}-${j}`} className="border-b border-white/5 hover:bg-white/5">
+                                <td className="p-3 text-white/40 truncate max-w-[120px]">{file.path.split('\\').pop() || file.path.split('/').pop()}</td>
+                                <td className="p-3 text-white font-semibold">{sym.name}</td>
+                                <td className="p-3">
+                                  <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold uppercase ${
+                                    sym.kind === 'function' ? 'bg-violet-500/15 text-violet-400' :
+                                    sym.kind === 'struct' || sym.kind === 'class' ? 'bg-amber-500/15 text-amber-400' :
+                                    sym.kind === 'impl' ? 'bg-indigo-500/15 text-indigo-400' :
+                                    'bg-white/10 text-white/50'
+                                  }`}>{sym.kind}</span>
+                                </td>
+                                <td className="p-3 text-white/30">{sym.start_line}–{sym.end_line}</td>
+                              </tr>
+                            ))
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -499,6 +623,8 @@ const App: React.FC = () => {
                       ? 'bg-amber-500/10 text-amber-400'
                       : log.type === 'gemini'
                       ? 'bg-violet-500/10 text-violet-400'
+                      : log.type === 'watcher'
+                      ? 'bg-cyan-500/10 text-cyan-400'
                       : 'bg-white/5 text-white/50'
                   }`}>
                     {log.type}

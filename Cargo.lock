@@ -79,10 +79,13 @@ dependencies = [
  "notify",
  "reqwest 0.12.28",
  "rusqlite",
+ "serde",
  "tauri",
  "tauri-build",
  "tokio",
  "tree-sitter",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
  "zerocopy 0.4.1",
 ]
 
@@ -4913,6 +4916,26 @@ name = "tree-sitter-language"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "009994f150cc0cd50ff54917d5bc8bffe8cad10ca10d81c34da2ec421ae61782"
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "277690f420bf90741dea984f3da038ace46c4fe6047cba57a66822226cde1c93"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecb35d98a688378e56c18c9c159824fd16f730ccbea19aacf4f206e5d5438ed9"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
 
 [[package]]
 name = "try-lock"
