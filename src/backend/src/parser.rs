@@ -151,14 +151,19 @@ fn traverse_node(node: tree_sitter::Node, source: &str, symbols: &mut Vec<ASTSym
 }
 
 fn get_node_signature(node: tree_sitter::Node, source: &str) -> String {
-    // Extract the signature (usually from the start of node to the opening brace '{')
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
-    let node_text = &source[start_byte..end_byte];
-
-    if let Some(brace_pos) = node_text.find('{') {
-        node_text[..brace_pos].trim().to_string()
+    
+    let bytes = source.as_bytes();
+    if start_byte < bytes.len() && end_byte <= bytes.len() {
+        let node_bytes = &bytes[start_byte..end_byte];
+        let node_text = String::from_utf8_lossy(node_bytes);
+        if let Some(brace_pos) = node_text.find('{') {
+            node_text[..brace_pos].trim().to_string()
+        } else {
+            node_text.trim().to_string()
+        }
     } else {
-        node_text.trim().to_string()
+        "".to_string()
     }
 }

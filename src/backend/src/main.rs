@@ -4,6 +4,7 @@ pub mod cache;
 pub mod db;
 pub mod embeddings;
 pub mod parser;
+pub mod security;
 pub mod watcher;
 
 use crate::cache::SymbolCache;
@@ -14,7 +15,7 @@ use tauri::{Emitter, Manager, State};
 
 pub struct AppState {
     pub workspace_root: std::sync::Arc<Mutex<String>>,
-    pub api_token: std::sync::Arc<Mutex<String>>,
+    pub api_token: std::sync::Arc<Mutex<Option<crate::security::ObfBox>>>,
     pub logs: std::sync::Arc<Mutex<Vec<String>>>,
     pub symbol_cache: std::sync::Arc<Mutex<SymbolCache>>,
     pub watcher_handle: std::sync::Arc<Mutex<Option<WatcherHandle>>>,
@@ -27,7 +28,7 @@ impl Default for AppState {
             workspace_root: std::sync::Arc::new(Mutex::new(
                 "D:\\Project\\Antigravity SDK".to_string(),
             )),
-            api_token: std::sync::Arc::new(Mutex::new("••••••••••••••••••••••••".to_string())),
+            api_token: std::sync::Arc::new(Mutex::new(None)),
             logs: std::sync::Arc::new(Mutex::new(vec![
                 "Antigravity workspace kernel booting...".to_string(),
                 "Tauri v2 IPC communication channel established.".to_string(),
@@ -97,7 +98,7 @@ fn crawl_workspace(dir: &Path, files: &mut Vec<PathBuf>) {
 async fn index_file(
     conn_mutex: &Mutex<Option<rusqlite::Connection>>,
     file_path: &Path,
-    api_token: &str,
+    api_token: &crate::security::ObfBox,
 ) -> Result<usize, String> {
     let content =
         std::fs::read_to_string(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
@@ -188,14 +189,48 @@ fn get_symbols(state: State<'_, AppState>) -> Vec<FileSymbols> {
 #[tauri::command]
 fn save_config(
     workspace_root: String,
-    api_token: String,
+    mut api_token: String,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    *state.workspace_root.lock().unwrap() = workspace_root.clone();
-    *state.api_token.lock().unwrap() = api_token;
+    use zeroize::Zeroize;
 
+    *state.workspace_root.lock().unwrap() = workspace_root.clone();
+
+    // 1. Persist workspace root to config.json
+    if let Ok(app_data) = app_handle.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&app_data);
+        let config_path = app_data.join("config.json");
+        let config = serde_json::json!({
+            "workspace_root": workspace_root
+        });
+        if let Ok(content) = serde_json::to_string(&config) {
+            let _ = std::fs::write(config_path, content);
+        }
+    }
+
+    // 2. Persist api_token to OS Keyring securely (or delete if empty)
     let mut logs = state.logs.lock().unwrap();
+    if api_token.trim().is_empty() {
+        let _ = crate::security::delete_api_token();
+        *state.api_token.lock().unwrap() = None;
+        logs.push("Security: Gemini API Key deleted from secure storage.".to_string());
+    } else if !api_token.starts_with('•') && !api_token.starts_with("•••") {
+        match crate::security::save_api_token(&api_token) {
+            Ok(_) => {
+                let obf = crate::security::ObfBox::new(api_token.as_bytes());
+                *state.api_token.lock().unwrap() = Some(obf);
+                logs.push("Security: Saved API Key to OS Keyring successfully.".to_string());
+            }
+            Err(e) => {
+                logs.push(format!("Security: Failed to save API Key to OS Keyring: {}", e));
+            }
+        }
+    }
+
+    // Destructively zeroize the plain-text String immediately
+    api_token.zeroize();
+
     logs.push(format!(
         "Configuration updated. Workspace root set to: {}",
         workspace_root
@@ -268,23 +303,25 @@ async fn index_workspace(
         ws.clone()
     };
 
-    let api_key = {
+    let api_key_obf = {
         let key = state.api_token.lock().unwrap();
         key.clone()
     };
 
-    let final_api_key = if api_key.is_empty() || api_key.starts_with("•••") {
-        if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-            *state.api_token.lock().unwrap() = env_key.clone();
-            env_key
-        } else {
-            return Err(
-                "Gemini API key is not configured. Please supply a key in Configuration settings."
-                    .to_string(),
-            );
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
+                let obf = crate::security::ObfBox::new(env_key.as_bytes());
+                *state.api_token.lock().unwrap() = Some(obf.clone());
+                obf
+            } else {
+                return Err(
+                    "Gemini API key is not configured. Please supply a key in Configuration settings."
+                        .to_string(),
+                );
+            }
         }
-    } else {
-        api_key
     };
 
     let workspace_path = std::path::PathBuf::from(&workspace);
@@ -372,22 +409,25 @@ async fn search_symbols(
     limit: i32,
     state: State<'_, AppState>,
 ) -> Result<Vec<db::SearchResult>, String> {
-    let api_key = {
+    let api_key_obf = {
         let key = state.api_token.lock().unwrap();
         key.clone()
     };
 
-    let final_api_key = if api_key.is_empty() || api_key.starts_with("•••") {
-        if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-            env_key
-        } else {
-            return Err(
-                "Gemini API key is not configured. Please supply a key in Configuration settings."
-                    .to_string(),
-            );
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
+                let obf = crate::security::ObfBox::new(env_key.as_bytes());
+                *state.api_token.lock().unwrap() = Some(obf.clone());
+                obf
+            } else {
+                return Err(
+                    "Gemini API key is not configured. Please supply a key in Configuration settings."
+                        .to_string(),
+                );
+            }
         }
-    } else {
-        api_key
     };
 
     let embedding = embeddings::get_embedding(&final_api_key, &query)
@@ -439,6 +479,22 @@ fn execute_command(command: String, state: State<'_, AppState>) -> Result<String
     Ok("Compilation passed after self-healing".to_string())
 }
 
+#[derive(serde::Serialize)]
+struct ConfigPayload {
+    workspace_root: String,
+    has_key: bool,
+}
+
+#[tauri::command]
+fn get_config(state: State<'_, AppState>) -> ConfigPayload {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    let has_k = state.api_token.lock().unwrap().is_some();
+    ConfigPayload {
+        workspace_root: ws,
+        has_key: has_k,
+    }
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -446,10 +502,34 @@ fn main() {
             let state = app.state::<AppState>();
             let app_handle = app.handle().clone();
 
+            // 1. Try to load workspace_root from local config.json
+            if let Ok(app_data) = app_handle.path().app_data_dir() {
+                let config_path = app_data.join("config.json");
+                if config_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&config_path) {
+                        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                            if let Some(ws) = val.get("workspace_root").and_then(|v| v.as_str()) {
+                                *state.workspace_root.lock().unwrap() = ws.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+
             let workspace = {
                 let ws = state.workspace_root.lock().unwrap();
                 ws.clone()
             };
+
+            // 2. Try to load API token from OS Keyring
+            if let Ok(obf) = crate::security::load_api_token() {
+                *state.api_token.lock().unwrap() = Some(obf);
+                let mut logs = state.logs.lock().unwrap();
+                logs.push("Security: Restored Gemini API Key from secure OS Keyring.".to_string());
+            } else {
+                let mut logs = state.logs.lock().unwrap();
+                logs.push("Security: No Gemini API Key found in OS Keyring. Please configure one in Settings.".to_string());
+            }
 
             // Initialize DB
             if let Err(e) = open_and_init_workspace_db(&workspace, &app_handle, &state) {
@@ -489,6 +569,7 @@ fn main() {
             get_logs,
             get_symbols,
             save_config,
+            get_config,
             execute_command,
             index_workspace,
             search_symbols

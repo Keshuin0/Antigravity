@@ -39,24 +39,42 @@ struct BatchEmbedResponse {
     embeddings: Vec<EmbeddingValues>,
 }
 
-pub async fn get_embedding(api_key: &str, text: &str) -> Result<Vec<f32>, String> {
+fn safe_truncate(text: &str, max_chars: usize) -> &str {
+    if text.len() > max_chars {
+        match text.char_indices().nth(max_chars) {
+            Some((idx, _)) => &text[..idx],
+            None => text,
+        }
+    } else {
+        text
+    }
+}
+
+pub async fn get_embedding(api_key: &crate::security::ObfBox, text: &str) -> Result<Vec<f32>, String> {
+    use zeroize::Zeroizing;
+
     let client = Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent?key={}",
-        api_key
-    );
+    let url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
+
+    let decrypted_key = Zeroizing::new(api_key.decrypt());
+    let mut header_val = reqwest::header::HeaderValue::from_bytes(&decrypted_key)
+        .map_err(|e| format!("Invalid header value: {}", e))?;
+    header_val.set_sensitive(true);
+
+    let truncated = safe_truncate(text, 8000);
 
     let payload = EmbedRequest {
         model: MODEL_NAME.to_string(),
         content: Content {
             parts: vec![ContentPart {
-                text: text.to_string(),
+                text: truncated.to_string(),
             }],
         },
     };
 
     let response = client
-        .post(&url)
+        .post(url)
+        .header("x-goog-api-key", header_val)
         .json(&payload)
         .send()
         .await
@@ -77,38 +95,44 @@ pub async fn get_embedding(api_key: &str, text: &str) -> Result<Vec<f32>, String
 }
 
 pub async fn get_embeddings_batch(
-    api_key: &str,
+    api_key: &crate::security::ObfBox,
     texts: &[String],
 ) -> Result<Vec<Vec<f32>>, String> {
     if texts.is_empty() {
         return Ok(vec![]);
     }
 
-    let client = Client::new();
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents?key={}",
-        api_key
-    );
+    use zeroize::Zeroizing;
 
-    // Gemini batch requests typically have a size limit (e.g. 100 items per request)
-    // We chunk the batch to be safe and efficient
+    let client = Client::new();
+    let url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents";
+
+    let decrypted_key = Zeroizing::new(api_key.decrypt());
+    let mut header_val = reqwest::header::HeaderValue::from_bytes(&decrypted_key)
+        .map_err(|e| format!("Invalid header value: {}", e))?;
+    header_val.set_sensitive(true);
+
     let mut results = vec![];
 
     for chunk in texts.chunks(100) {
         let requests = chunk
             .iter()
-            .map(|t| EmbedRequest {
-                model: MODEL_NAME.to_string(),
-                content: Content {
-                    parts: vec![ContentPart { text: t.clone() }],
-                },
+            .map(|t| {
+                let truncated = safe_truncate(t, 8000);
+                EmbedRequest {
+                    model: MODEL_NAME.to_string(),
+                    content: Content {
+                        parts: vec![ContentPart { text: truncated.to_string() }],
+                    },
+                }
             })
             .collect();
 
         let payload = BatchEmbedRequest { requests };
 
         let response = client
-            .post(&url)
+            .post(url)
+            .header("x-goog-api-key", header_val.clone())
             .json(&payload)
             .send()
             .await
