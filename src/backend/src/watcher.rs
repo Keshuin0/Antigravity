@@ -152,30 +152,164 @@ async fn handle_debounced_changes(
 
         if path.exists() {
             event_kind_str = "modify".to_string();
-            // Read and re-parse the file
+
+            // Read and re-parse the file for AST Symbol Memory Cache
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let mut cache = app_state.symbol_cache.lock().unwrap();
-                if let Ok(symbols) = cache.update_file(&path, &content) {
-                    symbols_count = symbols.len();
-                    let log_msg = format!(
-                        "Watcher: AST parsed '{}' (found {} symbols).",
-                        rel_path, symbols_count
-                    );
-                    let mut logs = app_state.logs.lock().unwrap();
-                    logs.push(log_msg);
-                }
+                let symbols = {
+                    let mut cache = app_state.symbol_cache.lock().unwrap();
+                    match cache.update_file(&path, &content) {
+                        Ok(syms) => {
+                            symbols_count = syms.len();
+                            let log_msg = format!(
+                                "Watcher: AST parsed '{}' (found {} symbols).",
+                                rel_path, symbols_count
+                            );
+                            let mut logs = app_state.logs.lock().unwrap();
+                            logs.push(log_msg);
+                            syms
+                        }
+                        Err(e) => {
+                            let mut logs = app_state.logs.lock().unwrap();
+                            logs.push(format!(
+                                "Watcher: Failed to update AST cache for {}: {}",
+                                rel_path, e
+                            ));
+                            continue;
+                        }
+                    }
+                };
+
+                // Bleeding-Edge Pinnacle Choice: Run Smart-Hashed DB upsert and auto-embedding in background
+                let api_key = {
+                    let key = app_state.api_token.lock().unwrap();
+                    key.clone()
+                };
+
+                let db_conn = app_state.db_conn.clone();
+                let logs_clone = app_state.logs.clone();
+                let app_handle_clone = app_handle.clone();
+                let path_clone = path.clone();
+                let rel_path_clone = rel_path.clone();
+
+                let last_modified = path
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .and_then(|t| {
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map_err(std::io::Error::other)
+                    })
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+
+                tokio::spawn(async move {
+                    let symbols_to_embed = {
+                        let mut db_lock = db_conn.lock().unwrap();
+                        if let Some(conn) = db_lock.as_mut() {
+                            match crate::db::upsert_file_and_symbols(
+                                conn,
+                                &path_clone.to_string_lossy(),
+                                &content,
+                                last_modified,
+                                &symbols,
+                            ) {
+                                Ok(syms) => syms,
+                                Err(e) => {
+                                    let mut logs = logs_clone.lock().unwrap();
+                                    logs.push(format!(
+                                        "Watcher Database Error: Failed to upsert file: {}",
+                                        e
+                                    ));
+                                    return;
+                                }
+                            }
+                        } else {
+                            return;
+                        }
+                    };
+
+                    if symbols_to_embed.is_empty() {
+                        return; // Content is unchanged or hash is matched. Skip embedding.
+                    }
+
+                    let final_api_key = if api_key.is_empty() || api_key.starts_with("•••") {
+                        if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
+                            env_key
+                        } else {
+                            let mut logs = logs_clone.lock().unwrap();
+                            logs.push(
+                                "Watcher: Auto-indexing skipped. Gemini API key is missing."
+                                    .to_string(),
+                            );
+                            return;
+                        }
+                    } else {
+                        api_key
+                    };
+
+                    let texts: Vec<String> =
+                        symbols_to_embed.iter().map(|s| s.content.clone()).collect();
+                    match crate::embeddings::get_embeddings_batch(&final_api_key, &texts).await {
+                        Ok(embeddings) => {
+                            let mut db_lock = db_conn.lock().unwrap();
+                            if let Some(conn) = db_lock.as_mut() {
+                                for (i, sym) in symbols_to_embed.iter().enumerate() {
+                                    if i < embeddings.len() {
+                                        let _ = crate::db::save_embedding(
+                                            conn,
+                                            sym.symbol_id,
+                                            &embeddings[i],
+                                        );
+                                    }
+                                }
+                                let mut logs = logs_clone.lock().unwrap();
+                                logs.push(format!(
+                                    "Watcher: Successfully auto-indexed and embedded {} symbols for '{}'",
+                                    symbols_to_embed.len(),
+                                    rel_path_clone
+                                ));
+
+                                // Notify UI to refresh
+                                let _ = app_handle_clone.emit("vector-index-updated", ());
+                            }
+                        }
+                        Err(e) => {
+                            let mut logs = logs_clone.lock().unwrap();
+                            logs.push(format!(
+                                "Watcher Error: Failed to auto-embed symbols for {}: {}",
+                                rel_path_clone, e
+                            ));
+                        }
+                    }
+                });
             }
         } else {
             event_kind_str = "remove".to_string();
+
             // Remove from AST symbol cache
             let mut cache = app_state.symbol_cache.lock().unwrap();
             cache.invalidate(&path);
+
             let log_msg = format!(
                 "Watcher: Invalidated symbols for deleted file '{}'.",
                 rel_path
             );
+
+            // Pinnacle: Delete from SQLite database and vector table
+            let db_conn = app_state.db_conn.clone();
+            let mut db_lock = db_conn.lock().unwrap();
+            if let Some(conn) = db_lock.as_mut() {
+                let path_str = path.to_string_lossy().to_string();
+                let _ = conn.execute(
+                    "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = (SELECT id FROM files WHERE path = ?1));",
+                    [&path_str],
+                );
+                let _ = conn.execute("DELETE FROM files WHERE path = ?1;", [&path_str]);
+            }
+
             let mut logs = app_state.logs.lock().unwrap();
             logs.push(log_msg);
+
+            let _ = app_handle.emit("vector-index-updated", ());
         }
 
         // Emit the event to the frontend
