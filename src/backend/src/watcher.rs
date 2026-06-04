@@ -6,6 +6,15 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::mpsc;
 
+pub fn clean_unc_path(path: &Path) -> PathBuf {
+    let path_str = path.to_string_lossy();
+    if let Some(stripped) = path_str.strip_prefix(r"\\?\") {
+        PathBuf::from(stripped)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 pub struct WatcherHandle {
     _watcher: RecommendedWatcher,
     pub debounce_abort: tokio::task::JoinHandle<()>,
@@ -139,11 +148,13 @@ async fn handle_debounced_changes(
     workspace_root: &Path,
 ) -> Result<(), String> {
     let app_state = app_handle.state::<AppState>();
+    let clean_root = clean_unc_path(workspace_root);
 
     for (path, _kind) in changes {
-        let rel_path = path
-            .strip_prefix(workspace_root)
-            .unwrap_or(&path)
+        let clean_path = clean_unc_path(&path);
+        let rel_path = clean_path
+            .strip_prefix(&clean_root)
+            .unwrap_or(&clean_path)
             .to_string_lossy()
             .to_string();
 
@@ -180,7 +191,7 @@ async fn handle_debounced_changes(
                 };
 
                 // Bleeding-Edge Pinnacle Choice: Run Smart-Hashed DB upsert and auto-embedding in background
-                let api_key = {
+                let api_key_obf = {
                     let key = app_state.api_token.lock().unwrap();
                     key.clone()
                 };
@@ -231,19 +242,20 @@ async fn handle_debounced_changes(
                         return; // Content is unchanged or hash is matched. Skip embedding.
                     }
 
-                    let final_api_key = if api_key.is_empty() || api_key.starts_with("•••") {
-                        if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-                            env_key
-                        } else {
-                            let mut logs = logs_clone.lock().unwrap();
-                            logs.push(
-                                "Watcher: Auto-indexing skipped. Gemini API key is missing."
-                                    .to_string(),
-                            );
-                            return;
+                    let final_api_key = match api_key_obf {
+                        Some(obf) => obf,
+                        None => {
+                            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
+                                crate::security::ObfBox::new(env_key.as_bytes())
+                            } else {
+                                let mut logs = logs_clone.lock().unwrap();
+                                logs.push(
+                                    "Watcher: Auto-indexing skipped. Gemini API key is missing."
+                                        .to_string(),
+                                );
+                                return;
+                            }
                         }
-                    } else {
-                        api_key
                     };
 
                     let texts: Vec<String> =

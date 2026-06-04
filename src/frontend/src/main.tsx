@@ -120,11 +120,29 @@ const App: React.FC = () => {
     }
   }, []);
 
+  // Load config from backend
+  const loadConfig = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      const config = await invoke<{ workspace_root: string; has_key: boolean }>('get_config');
+      setWorkspaceRoot(config.workspace_root);
+      if (config.has_key) {
+        setApiToken('••••••••••••••••••••••••');
+      } else {
+        setApiToken('');
+      }
+    } catch (err) {
+      addLog('error', `Failed to load configuration: ${err}`);
+    }
+  }, []);
+
   useEffect(() => {
     loadBackendLogs();
 
     // Verify Tauri Connection Bridge via Ping
     if (isTauri) {
+      loadConfig();
+
       invoke<string>('ping')
         .then((res) => {
           addLog('success', `Tauri Bridge Ping: Received "${res}" from Rust backend.`);
@@ -167,7 +185,7 @@ const App: React.FC = () => {
     }
 
     return undefined;
-  }, [loadBackendLogs, loadSymbols]);
+  }, [loadBackendLogs, loadSymbols, loadConfig]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
