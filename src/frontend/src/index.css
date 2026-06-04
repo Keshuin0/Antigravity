@@ -1,4 +1,4 @@
-@import "tailwindcss";
+@import 'tailwindcss';
 
 @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500;600;700&display=swap');
 
@@ -11,10 +11,10 @@ body {
   margin: 0;
   padding: 0;
   background-color: #030712;
-  background-image: 
-    radial-gradient(at 0% 0%, hsla(253,16%,7%,1) 0, transparent 50%), 
-    radial-gradient(at 50% 0%, hsla(225,39%,10%,1) 0, transparent 50%), 
-    radial-gradient(at 100% 0%, hsla(339,49%,10%,1) 0, transparent 50%);
+  background-image:
+    radial-gradient(at 0% 0%, hsla(253, 16%, 7%, 1) 0, transparent 50%),
+    radial-gradient(at 50% 0%, hsla(225, 39%, 10%, 1) 0, transparent 50%),
+    radial-gradient(at 100% 0%, hsla(339, 49%, 10%, 1) 0, transparent 50%);
   min-height: 100vh;
   color: #f3f4f6;
   overflow: hidden;

@@ -121,8 +121,9 @@ pub fn dpapi_encrypt(data: &[u8]) -> Result<Vec<u8>, String> {
         );
 
         if success != 0 {
-            let result = std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec();
-            
+            let result =
+                std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec();
+
             #[link(name = "kernel32")]
             extern "system" {
                 fn LocalFree(hMem: *mut c_void) -> *mut c_void;
@@ -165,8 +166,9 @@ pub fn dpapi_decrypt(encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
         );
 
         if success != 0 {
-            let result = std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec();
-            
+            let result =
+                std::slice::from_raw_parts(data_out.pbData, data_out.cbData as usize).to_vec();
+
             #[link(name = "kernel32")]
             extern "system" {
                 fn LocalFree(hMem: *mut c_void) -> *mut c_void;
@@ -206,8 +208,9 @@ pub fn save_api_token(token: &str) -> Result<(), String> {
 
     let entry = keyring::Entry::new("com.antigravity.workspace", "gemini_api_key")
         .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
-    
-    entry.set_password(&hex_encrypted)
+
+    entry
+        .set_password(&hex_encrypted)
         .map_err(|e| format!("Failed to save secret to keyring: {}", e))?;
 
     Ok(())
@@ -224,11 +227,12 @@ pub fn load_api_token() -> Result<ObfBox, String> {
     let entry = keyring::Entry::new("com.antigravity.workspace", "gemini_api_key")
         .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
 
-    let hex_encrypted = entry.get_password()
+    let hex_encrypted = entry
+        .get_password()
         .map_err(|e| format!("Failed to retrieve secret from keyring: {}", e))?;
 
-    let encrypted = hex::decode(hex_encrypted)
-        .map_err(|e| format!("Failed to decode hex secret: {}", e))?;
+    let encrypted =
+        hex::decode(hex_encrypted).map_err(|e| format!("Failed to decode hex secret: {}", e))?;
 
     let decrypted = dpapi_decrypt(&encrypted)?;
     let obf = ObfBox::new(&decrypted);

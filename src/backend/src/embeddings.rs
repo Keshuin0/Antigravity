@@ -50,11 +50,15 @@ fn safe_truncate(text: &str, max_chars: usize) -> &str {
     }
 }
 
-pub async fn get_embedding(api_key: &crate::security::ObfBox, text: &str) -> Result<Vec<f32>, String> {
+pub async fn get_embedding(
+    api_key: &crate::security::ObfBox,
+    text: &str,
+) -> Result<Vec<f32>, String> {
     use zeroize::Zeroizing;
 
     let client = Client::new();
-    let url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
+    let url =
+        "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
 
     let decrypted_key = Zeroizing::new(api_key.decrypt());
     let mut header_val = reqwest::header::HeaderValue::from_bytes(&decrypted_key)
@@ -122,7 +126,9 @@ pub async fn get_embeddings_batch(
                 EmbedRequest {
                     model: MODEL_NAME.to_string(),
                     content: Content {
-                        parts: vec![ContentPart { text: truncated.to_string() }],
+                        parts: vec![ContentPart {
+                            text: truncated.to_string(),
+                        }],
                     },
                 }
             })

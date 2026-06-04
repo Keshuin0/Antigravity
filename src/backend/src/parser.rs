@@ -153,7 +153,7 @@ fn traverse_node(node: tree_sitter::Node, source: &str, symbols: &mut Vec<ASTSym
 fn get_node_signature(node: tree_sitter::Node, source: &str) -> String {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
-    
+
     let bytes = source.as_bytes();
     if start_byte < bytes.len() && end_byte <= bytes.len() {
         let node_bytes = &bytes[start_byte..end_byte];

@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod db;
 pub mod embeddings;
+pub mod inference;
 pub mod parser;
 pub mod security;
 pub mod watcher;
@@ -223,7 +224,10 @@ fn save_config(
                 logs.push("Security: Saved API Key to OS Keyring successfully.".to_string());
             }
             Err(e) => {
-                logs.push(format!("Security: Failed to save API Key to OS Keyring: {}", e));
+                logs.push(format!(
+                    "Security: Failed to save API Key to OS Keyring: {}",
+                    e
+                ));
             }
         }
     }
@@ -445,6 +449,354 @@ async fn search_symbols(
     Ok(results)
 }
 
+fn parse_command_string(cmd: &str) -> Option<(String, Vec<String>)> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = cmd.chars();
+
+    while let Some(c) = chars.next() {
+        if c == '"' {
+            in_quotes = !in_quotes;
+        } else if c.is_whitespace() && !in_quotes {
+            if !current.is_empty() {
+                args.push(current.clone());
+                current.clear();
+            }
+        } else {
+            current.push(c);
+        }
+    }
+    if !current.is_empty() {
+        args.push(current);
+    }
+
+    if args.is_empty() {
+        None
+    } else {
+        let program = args.remove(0);
+        Some((program, args))
+    }
+}
+
+async fn run_micro_batcher(
+    mut rx: tokio::sync::mpsc::Receiver<String>,
+    channel: tauri::ipc::Channel<String>,
+) {
+    let mut batch = Vec::new();
+    let mut last_send = std::time::Instant::now();
+    let frame_duration = std::time::Duration::from_millis(16);
+
+    while let Some(msg) = rx.recv().await {
+        batch.push(msg);
+
+        let elapsed = last_send.elapsed();
+        if elapsed < frame_duration && batch.len() < 20 {
+            tokio::select! {
+                _ = tokio::time::sleep(frame_duration - elapsed) => {}
+                maybe_more = rx.recv() => {
+                    if let Some(more) = maybe_more {
+                        batch.push(more);
+                    }
+                }
+            }
+        }
+
+        if !batch.is_empty() {
+            let combined = batch.join("\n");
+            let _ = channel.send(combined);
+            batch.clear();
+            last_send = std::time::Instant::now();
+        }
+    }
+}
+
+async fn run_process_and_stream(
+    program: &str,
+    args: &[String],
+    workspace_root: &str,
+    tx: tokio::sync::mpsc::Sender<String>,
+) -> Result<(i32, String), String> {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    cmd.current_dir(workspace_root);
+    cmd.env("CARGO_TERM_COLOR", "always");
+    cmd.env("CLICOLOR_FORCE", "1");
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn process: {}", e))?;
+
+    let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
+    let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
+
+    let tx_out = tx.clone();
+    let tx_err = tx.clone();
+
+    let stdout_handle = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stdout).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            let _ = tx_out.send(line).await;
+        }
+    });
+
+    let stderr_accum = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let stderr_accum_clone = stderr_accum.clone();
+
+    let stderr_handle = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = reader.next_line().await {
+            {
+                let mut accum = stderr_accum_clone.lock().unwrap();
+                accum.push(line.clone());
+            }
+            let _ = tx_err.send(line).await;
+        }
+    });
+
+    let status = child
+        .wait()
+        .await
+        .map_err(|e| format!("Process execution failed: {}", e))?;
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
+
+    let exit_code = status.code().unwrap_or(-1);
+    let full_stderr = {
+        let accum = stderr_accum.lock().unwrap();
+        accum.join("\n")
+    };
+
+    Ok((exit_code, full_stderr))
+}
+
+fn find_error_file_in_stderr(stderr: &str, workspace: &str) -> Option<PathBuf> {
+    let clean_workspace = crate::watcher::clean_unc_path(Path::new(workspace));
+
+    for word in stderr.split_whitespace() {
+        let cleaned = word.trim_matches(|c: char| {
+            c == ':' || c == ',' || c == '"' || c == '\'' || c == '(' || c == ')'
+        });
+
+        let path = Path::new(cleaned);
+        if path.is_file() {
+            let clean_path = crate::watcher::clean_unc_path(path);
+            if clean_path.starts_with(&clean_workspace) {
+                return Some(clean_path);
+            }
+        }
+
+        let rel_path = clean_workspace.join(cleaned);
+        if rel_path.is_file() {
+            return Some(crate::watcher::clean_unc_path(&rel_path));
+        }
+
+        let mut path_parts = cleaned.split(':');
+        if let Some(first_part) = path_parts.next() {
+            let rel_path_part = clean_workspace.join(first_part);
+            if rel_path_part.is_file() {
+                return Some(crate::watcher::clean_unc_path(&rel_path_part));
+            }
+        }
+    }
+    None
+}
+
+fn extract_markdown_code_block(content: &str) -> String {
+    let mut code = String::new();
+    let mut in_block = false;
+    for line in content.lines() {
+        if line.starts_with("```") {
+            if in_block {
+                break;
+            } else {
+                in_block = true;
+            }
+        } else if in_block {
+            code.push_str(line);
+            code.push('\n');
+        }
+    }
+    if code.is_empty() {
+        content.to_string()
+    } else {
+        code
+    }
+}
+
+async fn self_healing_loop(
+    command: String,
+    channel: tauri::ipc::Channel<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let workspace = {
+        let ws = state.workspace_root.lock().unwrap();
+        ws.clone()
+    };
+
+    let api_key_obf = {
+        let key = state.api_token.lock().unwrap();
+        key.clone()
+    };
+
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
+                crate::security::ObfBox::new(env_key.as_bytes())
+            } else {
+                return Err("Gemini API key is not configured. Self-healing aborted.".to_string());
+            }
+        }
+    };
+
+    let (program, args) = parse_command_string(&command)
+        .ok_or_else(|| "Failed to parse command arguments".to_string())?;
+
+    let mut recursion_depth = 0;
+    let max_depth = 3;
+
+    loop {
+        let (tx, rx) = tokio::sync::mpsc::channel(100);
+        let channel_clone = channel.clone();
+
+        let batcher_handle = tokio::spawn(run_micro_batcher(rx, channel_clone));
+
+        let _ = tx
+            .send(format!(
+                "[Self-Healing Engine] Executing: \"{}\" inside workspace...",
+                command
+            ))
+            .await;
+
+        let (exit_code, stderr_output) =
+            run_process_and_stream(&program, &args, &workspace, tx.clone()).await?;
+
+        drop(tx);
+        let _ = batcher_handle.await;
+
+        if exit_code == 0 {
+            let _ = channel.send("[Self-Healing Engine] Compilation passed cleanly!".to_string());
+            return Ok("Compilation passed cleanly".to_string());
+        }
+
+        recursion_depth += 1;
+        if recursion_depth > max_depth {
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Maximum healing attempts ({}) reached. Aborting loop.",
+                max_depth
+            ));
+            return Err("Self-healing failed after max attempts".to_string());
+        }
+
+        let _ = channel.send(format!(
+            "[Self-Healing Engine] Command failed with exit code {}. Attempting healing cycle {} of {}...",
+            exit_code, recursion_depth, max_depth
+        ));
+
+        let error_file_path = find_error_file_in_stderr(&stderr_output, &workspace);
+        let file_path = match error_file_path {
+            Some(path) => path,
+            None => {
+                let _ = channel.send("[Self-Healing Engine] Could not locate failing source file in logs. Self-healing aborted.".to_string());
+                return Err("Failed to locate target file in stderr".to_string());
+            }
+        };
+
+        let file_name = file_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let file_content = match std::fs::read_to_string(&file_path) {
+            Ok(content) => content,
+            Err(e) => {
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] Failed to read source file {}: {}",
+                    file_name, e
+                ));
+                return Err(format!("Failed to read file: {}", e));
+            }
+        };
+
+        let _ = channel.send(format!(
+            "[Self-Healing Engine] Isolated failing file: '{}'. Querying code fix from Gemini...",
+            file_name
+        ));
+
+        let prompt = format!(
+            "You are Antigravity's autonomous self-healing compilation agent.\n\
+             A compiler check failed. Here is the stderr output:\n\
+             ---\n\
+             {}\n\
+             ---\n\
+             Here is the current content of the source file '{}' that caused the compilation failure:\n\
+             ---\n\
+             {}\n\
+             ---\n\
+             Please rewrite this file to resolve the compilation error.\n\
+             IMPORTANT: Return ONLY the complete, modified code content for this file inside a markdown code block starting with ```[language]. Do not include any other explanations, comments, or conversational text. Return ONLY the markdown code block.",
+            stderr_output, file_name, file_content
+        );
+
+        let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(100);
+        let stream_channel = channel.clone();
+
+        let stream_batcher = tokio::spawn(run_micro_batcher(stream_rx, stream_channel));
+
+        let mut collected_response = String::new();
+        let (api_tx, mut api_rx) = tokio::sync::mpsc::channel(100);
+
+        let api_key_clone = final_api_key.clone();
+        let stream_tx_clone = stream_tx.clone();
+
+        tokio::spawn(async move {
+            let _ =
+                crate::inference::stream_generate_content(&api_key_clone, &prompt, api_tx).await;
+        });
+
+        while let Some(token) = api_rx.recv().await {
+            collected_response.push_str(&token);
+            let _ = stream_tx_clone.send(token.clone()).await;
+        }
+
+        drop(stream_tx_clone);
+        let _ = stream_batcher.await;
+
+        let patched_code = extract_markdown_code_block(&collected_response);
+        if patched_code.trim().is_empty() {
+            let _ = channel.send("[Self-Healing Engine] Gemini returned empty or invalid patch format. Healing failed.".to_string());
+            return Err("Gemini returned invalid patch format".to_string());
+        }
+
+        if let Err(e) = std::fs::write(&file_path, &patched_code) {
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Failed to write patch to disk: {}",
+                e
+            ));
+            return Err(format!("Failed to write patch: {}", e));
+        }
+
+        let _ = channel.send(format!(
+            "[Self-Healing Engine] Applied zero-copy code mutation to '{}'. Re-running check...",
+            file_name
+        ));
+    }
+}
+
+#[tauri::command]
+async fn execute_command_stream(
+    command: String,
+    channel: tauri::ipc::Channel<String>,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    self_healing_loop(command, channel, state).await
+}
+
 #[tauri::command]
 fn execute_command(command: String, state: State<'_, AppState>) -> Result<String, String> {
     if command.trim().is_empty() {
@@ -571,6 +923,7 @@ fn main() {
             save_config,
             get_config,
             execute_command,
+            execute_command_stream,
             index_workspace,
             search_symbols
         ])
