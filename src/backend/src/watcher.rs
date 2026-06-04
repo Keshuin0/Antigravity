@@ -1,10 +1,10 @@
+use crate::AppState;
+use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use notify::{Watcher, RecommendedWatcher, RecursiveMode, Event, EventKind};
-use tokio::sync::mpsc;
 use tauri::{AppHandle, Emitter, Manager};
-use serde::Serialize;
-use crate::AppState;
+use tokio::sync::mpsc;
 
 pub struct WatcherHandle {
     _watcher: RecommendedWatcher,
@@ -22,15 +22,15 @@ fn should_ignore_path(path: &Path) -> bool {
     for component in path.components() {
         if let Some(name) = component.as_os_str().to_str() {
             let name_lower = name.to_lowercase();
-            if name_lower == ".git" 
-                || name_lower == "node_modules" 
-                || name_lower == "target" 
-                || name_lower == "dist" 
-                || name_lower == ".next" 
+            if name_lower == ".git"
+                || name_lower == "node_modules"
+                || name_lower == "target"
+                || name_lower == "dist"
+                || name_lower == ".next"
                 || name_lower == "build"
                 || name_lower == "package-lock.json"
                 || name_lower == "yarn.lock"
-                || name_lower == "pnpm-lock.yaml" 
+                || name_lower == "pnpm-lock.yaml"
             {
                 return true;
             }
@@ -52,7 +52,8 @@ pub fn start_watching(
             let _ = tx_clone.blocking_send(res);
         },
         notify::Config::default(),
-    ).map_err(|e| e.to_string())?;
+    )
+    .map_err(|e| e.to_string())?;
 
     watcher
         .watch(workspace_path, RecursiveMode::Recursive)
@@ -63,7 +64,8 @@ pub fn start_watching(
 
     // Async task to handle events and debounce them
     let debounce_abort = tokio::spawn(async move {
-        let mut pending_events: std::collections::HashMap<PathBuf, (Instant, EventKind)> = std::collections::HashMap::new();
+        let mut pending_events: std::collections::HashMap<PathBuf, (Instant, EventKind)> =
+            std::collections::HashMap::new();
         let debounce_duration = Duration::from_millis(500);
 
         loop {
@@ -139,7 +141,8 @@ async fn handle_debounced_changes(
     let app_state = app_handle.state::<AppState>();
 
     for (path, _kind) in changes {
-        let rel_path = path.strip_prefix(workspace_root)
+        let rel_path = path
+            .strip_prefix(workspace_root)
             .unwrap_or(&path)
             .to_string_lossy()
             .to_string();
@@ -154,7 +157,10 @@ async fn handle_debounced_changes(
                 let mut cache = app_state.symbol_cache.lock().unwrap();
                 if let Ok(symbols) = cache.update_file(&path, &content) {
                     symbols_count = symbols.len();
-                    let log_msg = format!("Watcher: AST parsed '{}' (found {} symbols).", rel_path, symbols_count);
+                    let log_msg = format!(
+                        "Watcher: AST parsed '{}' (found {} symbols).",
+                        rel_path, symbols_count
+                    );
                     let mut logs = app_state.logs.lock().unwrap();
                     logs.push(log_msg);
                 }
@@ -164,7 +170,10 @@ async fn handle_debounced_changes(
             // Remove from AST symbol cache
             let mut cache = app_state.symbol_cache.lock().unwrap();
             cache.invalidate(&path);
-            let log_msg = format!("Watcher: Invalidated symbols for deleted file '{}'.", rel_path);
+            let log_msg = format!(
+                "Watcher: Invalidated symbols for deleted file '{}'.",
+                rel_path
+            );
             let mut logs = app_state.logs.lock().unwrap();
             logs.push(log_msg);
         }
@@ -180,4 +189,3 @@ async fn handle_debounced_changes(
 
     Ok(())
 }
-

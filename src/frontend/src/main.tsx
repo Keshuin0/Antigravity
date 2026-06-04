@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -31,10 +31,12 @@ interface FileSymbols {
 }
 
 // Detect if running inside the Tauri WebView environment
-const isTauri = typeof window !== 'undefined' && (window as any).__TAURI_INTERNALS__ !== undefined;
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
+
+type TabId = 'overview' | 'compiler' | 'vectors' | 'config';
 
 const App: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'overview' | 'compiler' | 'vectors' | 'config'>('overview');
+  const [activeTab, setActiveTab] = useState<TabId>('overview');
   const [kernelStatus, setKernelStatus] = useState<'connecting' | 'active' | 'disconnected'>('connecting');
   const [geminiStatus, setGeminiStatus] = useState<'idle' | 'streaming' | 'success' | 'error'>('idle');
   const [workspaceRoot, setWorkspaceRoot] = useState<string>('D:\\Project\\Antigravity SDK');
@@ -54,7 +56,7 @@ const App: React.FC = () => {
   };
 
   // Helper to load logs from the Rust backend state
-  const loadBackendLogs = async () => {
+  const loadBackendLogs = useCallback(async () => {
     if (!isTauri) {
       // Fallback default logs for browser view
       setLogs([
@@ -90,10 +92,10 @@ const App: React.FC = () => {
       addLog('error', `Failed to load logs from backend: ${err}`);
       setKernelStatus('disconnected');
     }
-  };
+  }, []);
 
   // Load symbol index from backend
-  const loadSymbols = async () => {
+  const loadSymbols = useCallback(async () => {
     if (!isTauri) return;
     try {
       const result = await invoke<FileSymbols[]>('get_symbols');
@@ -101,7 +103,7 @@ const App: React.FC = () => {
     } catch (_) {
       // Symbols may not be populated yet
     }
-  };
+  }, []);
 
   useEffect(() => {
     loadBackendLogs();
@@ -138,7 +140,9 @@ const App: React.FC = () => {
 
       return () => { if (unlisten) unlisten(); };
     }
-  }, []);
+
+    return undefined;
+  }, [loadBackendLogs, loadSymbols]);
 
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -231,7 +235,7 @@ const App: React.FC = () => {
               ].map((tab) => (
                 <button
                   key={tab.id}
-                  onClick={() => setActiveTab(tab.id as any)}
+                  onClick={() => setActiveTab(tab.id as TabId)}
                   className={`w-full flex items-center space-x-3 px-4 py-3 rounded-lg text-sm transition-all duration-200 outline-none ${
                     activeTab === tab.id
                       ? 'bg-white/10 text-white font-medium shadow-inner'
@@ -548,7 +552,7 @@ const App: React.FC = () => {
                   <h3 className="font-semibold text-white">Semantic Similarity Searches</h3>
                   <p className="text-xs text-white/50">
                     When you request context, Antigravity generates an embedding for your query and matches it locally using cosine similarity
-                    against the `workspace_vectors` table. This allows the system to instantly find relevant functions across your files even if they don't match the search terms exactly.
+                    against the `workspace_vectors` table. This allows the system to instantly find relevant functions across your files even if they don&apos;t match the search terms exactly.
                   </p>
                 </div>
               </div>

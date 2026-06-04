@@ -1,7 +1,7 @@
+use crate::parser::{parse_file, ASTSymbol};
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
 use std::fs;
-use crate::parser::{ASTSymbol, parse_file};
+use std::path::{Path, PathBuf};
 
 pub struct SymbolCache {
     capacity: usize,
@@ -50,7 +50,7 @@ impl SymbolCache {
                 self.cache.remove(&lru);
             }
         }
-        
+
         self.order.push_back(path.clone());
         self.cache.insert(path, symbols);
     }
@@ -75,6 +75,9 @@ impl SymbolCache {
     }
 
     pub fn get_all_cached_symbols(&self) -> Vec<(PathBuf, Vec<ASTSymbol>)> {
-        self.cache.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        self.cache
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
     }
 }

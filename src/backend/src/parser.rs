@@ -1,6 +1,6 @@
+use serde::{Deserialize, Serialize};
 use std::path::Path;
-use tree_sitter::{Parser, Language};
-use serde::{Serialize, Deserialize};
+use tree_sitter::{Language, Parser};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ASTSymbol {
@@ -30,9 +30,11 @@ pub fn parse_file(path: &Path, content: &str) -> Result<Vec<ASTSymbol>, String> 
     let mut parser = Parser::new();
     parser.set_language(&language).map_err(|e| e.to_string())?;
 
-    let tree = parser.parse(content, None).ok_or_else(|| "Failed to parse content".to_string())?;
+    let tree = parser
+        .parse(content, None)
+        .ok_or_else(|| "Failed to parse content".to_string())?;
     let mut symbols = Vec::new();
-    
+
     // Simple tree traversal for symbols (we'll expand this)
     let root_node = tree.root_node();
     traverse_node(root_node, content, &mut symbols, path);
@@ -94,21 +96,18 @@ fn traverse_node(node: tree_sitter::Node, source: &str, symbols: &mut Vec<ASTSym
             }
         }
         // TypeScript / TSX parser rules
-        (_, "function_declaration") | (_, "lexical_declaration") | (_, "variable_declaration") => {
-            // Check for TS/JS functions
-            if kind == "function_declaration" {
-                if let Some(name_node) = node.child_by_field_name("name") {
-                    if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
-                        let start = node.start_position().row + 1;
-                        let end = node.end_position().row + 1;
-                        symbols.push(ASTSymbol {
-                            name: name.to_string(),
-                            kind: "function".to_string(),
-                            start_line: start,
-                            end_line: end,
-                            signature: Some(get_node_signature(node, source)),
-                        });
-                    }
+        (_, "function_declaration") => {
+            if let Some(name_node) = node.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(source.as_bytes()) {
+                    let start = node.start_position().row + 1;
+                    let end = node.end_position().row + 1;
+                    symbols.push(ASTSymbol {
+                        name: name.to_string(),
+                        kind: "function".to_string(),
+                        start_line: start,
+                        end_line: end,
+                        signature: Some(get_node_signature(node, source)),
+                    });
                 }
             }
         }
@@ -156,7 +155,7 @@ fn get_node_signature(node: tree_sitter::Node, source: &str) -> String {
     let start_byte = node.start_byte();
     let end_byte = node.end_byte();
     let node_text = &source[start_byte..end_byte];
-    
+
     if let Some(brace_pos) = node_text.find('{') {
         node_text[..brace_pos].trim().to_string()
     } else {
