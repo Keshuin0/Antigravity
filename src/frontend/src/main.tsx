@@ -30,6 +30,15 @@ interface FileSymbols {
   symbols: ASTSymbol[];
 }
 
+interface SearchResult {
+  symbol_name: string;
+  symbol_kind: string;
+  file_path: string;
+  start_line: number;
+  end_line: number;
+  similarity: number;
+}
+
 // Detect if running inside the Tauri WebView environment
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
@@ -46,6 +55,12 @@ const App: React.FC = () => {
   const [fileChanges, setFileChanges] = useState<FileChangeEvent[]>([]);
   const [symbolIndex, setSymbolIndex] = useState<FileSymbols[]>([]);
   const [watcherActive, setWatcherActive] = useState(false);
+  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [similarityThreshold, setSimilarityThreshold] = useState<number>(0.5);
+  const [resultLimit, setResultLimit] = useState<number>(10);
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [isSearching, setIsSearching] = useState<boolean>(false);
+  const [isIndexing, setIsIndexing] = useState<boolean>(false);
 
   const logEndRef = useRef<HTMLDivElement>(null);
 
@@ -138,7 +153,17 @@ const App: React.FC = () => {
         loadSymbols();
       }).then((fn) => { unlisten = fn; });
 
-      return () => { if (unlisten) unlisten(); };
+      let unlistenUpdate: (() => void) | null = null;
+      listen('vector-index-updated', () => {
+        addLog('success', 'Database: Real-time vector index update finished. Searching is updated.');
+        setIsIndexing(false);
+        loadSymbols();
+      }).then((fn) => { unlistenUpdate = fn; });
+
+      return () => { 
+        if (unlisten) unlisten(); 
+        if (unlistenUpdate) unlistenUpdate();
+      };
     }
 
     return undefined;
@@ -199,6 +224,60 @@ const App: React.FC = () => {
       }
     } else {
       addLog('success', 'Configuration options updated (Browser Mock).');
+    }
+  };
+
+  const handleSearch = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!searchQuery.trim()) return;
+    setIsSearching(true);
+    addLog('info', `Semantic search: Querying database for "${searchQuery}" (threshold: ${similarityThreshold}, limit: ${resultLimit})...`);
+    
+    if (isTauri) {
+      try {
+        const results = await invoke<SearchResult[]>('search_symbols', {
+          query: searchQuery,
+          threshold: similarityThreshold,
+          limit: resultLimit
+        });
+        setSearchResults(results);
+        setIsSearching(false);
+        addLog('success', `Semantic search: Found ${results.length} matching code symbol(s).`);
+      } catch (err) {
+        addLog('error', `Semantic search failed: ${err}`);
+        setIsSearching(false);
+      }
+    } else {
+      // Browser mock results
+      setTimeout(() => {
+        const mockResults = [
+          { symbol_name: 'start_watching', symbol_kind: 'function', file_path: 'src/backend/src/watcher.rs', start_line: 42, end_line: 134, similarity: 0.94 },
+          { symbol_name: 'parse_file', symbol_kind: 'function', file_path: 'src/backend/src/parser.rs', start_line: 24, end_line: 80, similarity: 0.81 },
+          { symbol_name: 'SymbolCache', symbol_kind: 'struct', file_path: 'src/backend/src/cache.rs', start_line: 8, end_line: 45, similarity: 0.72 }
+        ].filter(r => r.similarity >= similarityThreshold).slice(0, resultLimit);
+        setSearchResults(mockResults);
+        setIsSearching(false);
+        addLog('success', `Semantic search: Found ${mockResults.length} matching code symbol(s) (Browser Mock).`);
+      }, 800);
+    }
+  };
+
+  const handleReindex = async () => {
+    setIsIndexing(true);
+    addLog('info', 'Database: Requesting background workspace re-indexing...');
+    if (isTauri) {
+      try {
+        const res = await invoke<string>('index_workspace');
+        addLog('success', `Database: ${res}`);
+      } catch (err) {
+        addLog('error', `Database indexing failed: ${err}`);
+        setIsIndexing(false);
+      }
+    } else {
+      setTimeout(() => {
+        setIsIndexing(false);
+        addLog('success', 'Workspace indexing simulated (Browser Mock).');
+      }, 1500);
     }
   };
 
@@ -515,8 +594,114 @@ const App: React.FC = () => {
 
             {activeTab === 'vectors' && (
               <div className="space-y-6">
+                {/* Search & Index Action Panel */}
                 <div className="glass-panel p-6 rounded-xl space-y-4">
-                  <h3 className="text-sm font-semibold text-white">`sqlite-vec` Local Index Details</h3>
+                  <div className="flex items-center justify-between">
+                    <h3 className="text-sm font-semibold text-white">Interactive Semantic Search Panel</h3>
+                    <button
+                      onClick={handleReindex}
+                      disabled={isIndexing}
+                      className="px-4 py-2 bg-gradient-to-tr from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold cursor-pointer active:scale-95 transition-all flex items-center space-x-2"
+                    >
+                      {isIndexing ? (
+                        <>
+                          <svg className="animate-spin h-3 w-3 text-white animate-pulse" fill="none" viewBox="0 0 24 24">
+                            <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                            <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                          </svg>
+                          <span>Indexing Workspace...</span>
+                        </>
+                      ) : (
+                        <span>Re-Index Workspace</span>
+                      )}
+                    </button>
+                  </div>
+                  
+                  <form onSubmit={handleSearch} className="space-y-4">
+                    <div className="flex space-x-3 items-center">
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={(e) => setSearchQuery(e.target.value)}
+                        className="flex-1 px-4 py-3 bg-black/40 border border-white/10 focus:border-violet-500/50 outline-none rounded-lg text-sm text-white font-mono"
+                        placeholder="Type a query for semantic matching (e.g. 'watcher configuration')..."
+                      />
+                      <button
+                        type="submit"
+                        disabled={isSearching || !searchQuery.trim()}
+                        className="px-6 py-3 bg-gradient-to-tr from-violet-600 to-indigo-600 hover:from-violet-500 hover:to-indigo-500 disabled:opacity-50 text-white rounded-lg text-sm font-medium transition-all cursor-pointer"
+                      >
+                        {isSearching ? 'Searching...' : 'Search'}
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-6 text-xs bg-white/5 p-4 rounded-lg border border-white/5">
+                      <div className="space-y-2">
+                        <div className="flex justify-between">
+                          <span className="text-white/40">Similarity Threshold:</span>
+                          <span className="font-semibold text-violet-400 font-mono">{(similarityThreshold * 100).toFixed(0)}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="1"
+                          step="0.05"
+                          value={similarityThreshold}
+                          onChange={(e) => setSimilarityThreshold(parseFloat(e.target.value))}
+                          className="w-full h-1 bg-white/10 rounded-lg appearance-none cursor-pointer accent-violet-500"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <div className="flex justify-between">
+                          <span className="text-white/40">Max Result Limit:</span>
+                          <span className="font-semibold text-violet-400 font-mono">{resultLimit} symbols</span>
+                        </div>
+                        <input
+                          type="number"
+                          min="1"
+                          max="50"
+                          value={resultLimit}
+                          onChange={(e) => setResultLimit(parseInt(e.target.value) || 10)}
+                          className="w-full px-2 py-1 bg-black/40 border border-white/10 rounded font-mono text-white text-xs outline-none"
+                        />
+                      </div>
+                    </div>
+                  </form>
+                </div>
+
+                {/* Search Results */}
+                {searchResults.length > 0 && (
+                  <div className="glass-panel p-6 rounded-xl space-y-4 animate-fade-in">
+                    <h3 className="text-sm font-semibold text-white">Semantic Search Matches (sqlite-vec)</h3>
+                    <div className="space-y-3 max-h-[350px] overflow-y-auto pr-2">
+                      {searchResults.map((res, i) => (
+                        <div key={i} className="p-4 bg-white/5 border border-white/5 hover:border-white/10 rounded-lg flex flex-col space-y-2 hover:bg-white/10 transition-all duration-200">
+                          <div className="flex justify-between items-start">
+                            <div>
+                              <span className="text-xs font-bold text-white font-mono">{res.symbol_name}</span>
+                              <span className={`ml-2 px-1.5 py-0.5 rounded text-[8px] font-bold uppercase font-mono ${
+                                res.symbol_kind === 'function' ? 'bg-violet-500/15 text-violet-400' :
+                                res.symbol_kind === 'struct' || res.symbol_kind === 'class' ? 'bg-amber-500/15 text-amber-400' :
+                                res.symbol_kind === 'impl' ? 'bg-indigo-500/15 text-indigo-400' :
+                                'bg-white/10 text-white/50'
+                              }`}>{res.symbol_kind}</span>
+                            </div>
+                            <span className="text-xs font-bold font-mono text-emerald-400">{(res.similarity * 100).toFixed(1)}% Match</span>
+                          </div>
+                          
+                          <div className="flex justify-between items-center text-[10px] text-white/40 font-mono">
+                            <span className="truncate max-w-[280px]">{res.file_path.split('\\').pop() || res.file_path.split('/').pop()}</span>
+                            <span>Lines {res.start_line}–{res.end_line}</span>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* sqlite-vec Statistics details */}
+                <div className="glass-panel p-6 rounded-xl space-y-4">
+                  <h3 className="text-sm font-semibold text-white">`sqlite-vec` Live Local Statistics</h3>
                   <div className="w-full border border-white/5 rounded-lg overflow-hidden bg-black/10">
                     <table className="w-full text-left border-collapse text-xs">
                       <thead>
@@ -524,36 +709,21 @@ const App: React.FC = () => {
                           <th className="p-4">Table Name</th>
                           <th className="p-4">Type</th>
                           <th className="p-4">Dimensions</th>
-                          <th className="p-4">Indexed Nodes</th>
-                          <th className="p-4">Status</th>
+                          <th className="p-4">Source Files</th>
+                          <th className="p-4">Vector Nodes</th>
                         </tr>
                       </thead>
                       <tbody className="font-mono text-white/70">
                         <tr className="border-b border-white/5 hover:bg-white/5">
-                          <td className="p-4 font-semibold text-white">workspace_vectors</td>
+                          <td className="p-4 font-semibold text-white">vec_symbols</td>
                           <td className="p-4">Virtual vec0</td>
-                          <td className="p-4">768</td>
-                          <td className="p-4">287</td>
-                          <td className="p-4 text-emerald-400">Synced</td>
-                        </tr>
-                        <tr className="border-b border-white/5 hover:bg-white/5">
-                          <td className="p-4 font-semibold text-white">ast_symbol_index</td>
-                          <td className="p-4">FTS5 SQLite</td>
-                          <td className="p-4">Text Indices</td>
-                          <td className="p-4">582</td>
-                          <td className="p-4 text-emerald-400">Synced</td>
+                          <td className="p-4">768 Dim (Float32)</td>
+                          <td className="p-4 text-white/50">{symbolIndex.length} Files</td>
+                          <td className="p-4 text-emerald-400">{symbolIndex.reduce((acc, f) => acc + f.symbols.length, 0)} Nodes</td>
                         </tr>
                       </tbody>
                     </table>
                   </div>
-                </div>
-
-                <div className="glass-card p-6 rounded-xl space-y-3">
-                  <h3 className="font-semibold text-white">Semantic Similarity Searches</h3>
-                  <p className="text-xs text-white/50">
-                    When you request context, Antigravity generates an embedding for your query and matches it locally using cosine similarity
-                    against the `workspace_vectors` table. This allows the system to instantly find relevant functions across your files even if they don&apos;t match the search terms exactly.
-                  </p>
                 </div>
               </div>
             )}
