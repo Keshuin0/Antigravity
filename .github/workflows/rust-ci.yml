@@ -1,19 +1,45 @@
-name: Rust Backend CI 
-on: 
-  push: 
-    branches: [main, dev] 
-  pull_request: 
-    branches: [main, dev] 
-jobs: 
-  validate: 
-    runs-on: ubuntu-latest 
-    steps: 
-      - uses: actions/checkout@v4 
-      - name: Install Stable Toolchain 
-        uses: dtolnay/rust-toolchain@stable 
-        with: 
-          components: clippy, rustfmt 
-      - name: Verify Code Formatting 
-        run: cargo fmt --manifest-path src/backend/Cargo.toml -- --check 
-      - name: Run Clippy Lints 
-        run: cargo clippy --manifest-path src/backend/Cargo.toml --all-targets -- -D warnings 
+name: Rust Backend CI
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Tauri System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libglib2.0-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo Registry & Build Artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Verify Code Formatting
+        run: cargo fmt --manifest-path src/backend/Cargo.toml -- --check
+
+      - name: Run Clippy Lints
+        run: cargo clippy --manifest-path src/backend/Cargo.toml --all-targets -- -D warnings
