@@ -959,6 +959,69 @@ fn get_config(state: State<'_, AppState>) -> ConfigPayload {
     }
 }
 
+#[derive(serde::Serialize)]
+struct VfsEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+}
+
+#[tauri::command]
+fn read_workspace_file_cmd(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path)
+        .map_err(|e| format!("Failed to read file: {}", e))
+}
+
+#[tauri::command]
+fn write_workspace_file_cmd(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content)
+        .map_err(|e| format!("Failed to write file: {}", e))
+}
+
+#[tauri::command]
+fn read_workspace_dir_cmd(path: String) -> Result<Vec<VfsEntry>, String> {
+    let mut entries = Vec::new();
+    let dir = std::path::Path::new(&path);
+    if !dir.is_dir() {
+        return Err("Not a directory".to_string());
+    }
+    
+    if let Ok(read_dir) = std::fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let entry_path = entry.path();
+            let is_dir = entry_path.is_dir();
+            let name = entry_path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            
+            // Skip common build/temp folders to keep tree high-performance
+            if is_dir && (name == ".git" || name == "node_modules" || name == "target" || name == "dist" || name == ".next") {
+                continue;
+            }
+            
+            entries.push(VfsEntry {
+                name,
+                path: entry_path.to_string_lossy().to_string(),
+                is_dir,
+            });
+        }
+    }
+    
+    // Sort directories first, then files alphabetically
+    entries.sort_by(|a, b| {
+        if a.is_dir && !b.is_dir {
+            std::cmp::Ordering::Less
+        } else if !a.is_dir && b.is_dir {
+            std::cmp::Ordering::Greater
+        } else {
+            a.name.to_lowercase().cmp(&b.name.to_lowercase())
+        }
+    });
+    
+    Ok(entries)
+}
+
 #[tauri::command]
 fn git_init_cmd(state: State<'_, AppState>) -> Result<(), String> {
     let ws = state.workspace_root.lock().unwrap().clone();
@@ -1093,7 +1156,10 @@ fn main() {
             git_create_commit_cmd,
             git_create_branch_cmd,
             git_checkout_branch_cmd,
-            git_rollback_to_commit_cmd
+            git_rollback_to_commit_cmd,
+            read_workspace_file_cmd,
+            write_workspace_file_cmd,
+            read_workspace_dir_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
