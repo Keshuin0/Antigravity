@@ -304,7 +304,7 @@ const App: React.FC = () => {
       setActiveFileContent(content);
       setOriginalFileContent(content);
       addLog('watcher', `VFS: Loaded code buffer for ${filePath.split('\\').pop() || filePath.split('/').pop()}`);
-    } catch (err: any) {
+    } catch (err) {
       addLog('error', `VFS Error: Failed to open file: ${err}`);
     }
   };
@@ -316,7 +316,7 @@ const App: React.FC = () => {
       await invoke('write_workspace_file_cmd', { path: activeFilePath, content: activeFileContent });
       setOriginalFileContent(activeFileContent);
       addLog('success', `VFS: Saved modifications to disk for ${activeFilePath.split('\\').pop() || activeFilePath.split('/').pop()}`);
-    } catch (err: any) {
+    } catch (err) {
       addLog('error', `VFS Error: Failed to save file changes: ${err}`);
     }
   };
@@ -381,7 +381,7 @@ const App: React.FC = () => {
       });
       addLog('success', `Self-Healing Loop Result: ${res}`);
       setGeminiStatus('success');
-    } catch (err: any) {
+    } catch (err) {
       addLog('error', `Self-Healing Loop Aborted: ${err}`);
       setGeminiStatus('error');
     } finally {
@@ -405,7 +405,7 @@ const App: React.FC = () => {
     try {
       const res = await invoke<string>('index_workspace');
       addLog('info', `Database: ${res}`);
-    } catch (e: any) {
+    } catch (e) {
       addLog('error', `Database Error: Failed to queue index crawl: ${e}`);
       setIsIndexing(false);
     }
@@ -444,7 +444,7 @@ const App: React.FC = () => {
       });
       setSearchResults(results);
       addLog('success', `Database: Found ${results.length} matching AST symbols.`);
-    } catch (e: any) {
+    } catch (e) {
       addLog('error', `Database Error: Semantic search failed: ${e}`);
     } finally {
       setIsSearching(false);
@@ -466,7 +466,7 @@ const App: React.FC = () => {
       });
       addLog('success', `Configuration: ${res}`);
       loadConfig();
-    } catch (e: any) {
+    } catch (e) {
       addLog('error', `Configuration Error: Save settings failed: ${e}`);
     }
   };
@@ -1047,7 +1047,7 @@ const App: React.FC = () => {
                       
                       {/* Log Console Output */}
                       <div className="flex-1 overflow-y-auto px-4 py-2 bg-black/30 border border-white/5 rounded-md text-[10px] leading-relaxed custom-scrollbar text-neutral-300">
-                        <div className="text-white/40">// Self-Healing compiler loop outputs stream here...</div>
+                        <div className="text-white/40">{"// Self-Healing compiler loop outputs stream here..."}</div>
                         {logs.filter(l => l.message.includes('[Self-Healing Engine]')).map((log) => (
                           <div key={log.id} className="mt-1">
                             <span className="text-white/20 mr-2">{log.time}</span>

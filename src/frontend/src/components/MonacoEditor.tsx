@@ -42,15 +42,17 @@ const getLanguageFromExtension = (path: string): string => {
   }
 };
 
+type StandaloneCodeEditor = Parameters<NonNullable<React.ComponentProps<typeof Editor>['onMount']>>[0];
+
 export const MonacoEditor: React.FC<MonacoEditorProps> = ({
   filePath,
   content,
   onContentChange,
   onSave,
 }) => {
-  const editorRef = useRef<any>(null);
+  const editorRef = useRef<StandaloneCodeEditor | null>(null);
 
-  const handleEditorDidMount = (editor: any, monaco: Monaco) => {
+  const handleEditorDidMount = (editor: StandaloneCodeEditor, monaco: Monaco) => {
     editorRef.current = editor;
 
     // Define a custom, high-fidelity dark telemetry theme

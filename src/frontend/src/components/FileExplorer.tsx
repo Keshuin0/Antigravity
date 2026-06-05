@@ -154,10 +154,10 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         if (active) {
           setRootEntries(res);
         }
-      } catch (err: any) {
+      } catch (err) {
         console.error('Failed to load workspace root:', err);
         if (active) {
-          setError(typeof err === 'string' ? err : err.message || 'Failed to list directory');
+          setError(err instanceof Error ? err.message : String(err));
         }
       } finally {
         if (active) {
@@ -186,8 +186,8 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
             try {
               const res = await invoke<VfsEntry[]>('read_workspace_dir_cmd', { path: workspaceRoot });
               setRootEntries(res);
-            } catch (err: any) {
-              setError(err.toString());
+            } catch (err) {
+              setError(String(err));
             } finally {
               setLoading(false);
             }

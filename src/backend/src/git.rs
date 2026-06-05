@@ -25,11 +25,10 @@ pub fn git_current_branch(path: &str) -> Result<String, String> {
     if repo.head_detached().unwrap_or(false) {
         return Ok("DETACHED".to_string());
     }
-    let head = repo.head().map_err(|e| format!("Failed to get HEAD: {}", e))?;
-    let name = head
-        .shorthand()
-        .unwrap_or("unknown")
-        .to_string();
+    let head = repo
+        .head()
+        .map_err(|e| format!("Failed to get HEAD: {}", e))?;
+    let name = head.shorthand().unwrap_or("unknown").to_string();
     Ok(name)
 }
 
@@ -80,14 +79,14 @@ pub fn git_status(path: &str) -> Result<Vec<GitFileStatus>, String> {
 pub fn git_stage_files(path: &str, files: Vec<String>) -> Result<(), String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
-    
+
     for file in files {
         let file_path = Path::new(&file);
         index
             .add_path(file_path)
             .map_err(|e| format!("Failed to stage file '{}': {}", file, e))?;
     }
-    
+
     index
         .write()
         .map_err(|e| format!("Failed to write index: {}", e))
@@ -104,9 +103,10 @@ pub fn git_create_commit(path: &str, message: &str) -> Result<String, String> {
         .find_tree(tree_id)
         .map_err(|e| format!("Failed to find index tree: {}", e))?;
 
-    let sig = repo.signature().or_else(|_| {
-        git2::Signature::now("Antigravity Engine", "agent@antigravity.ai")
-    }).map_err(|e| format!("Failed to resolve signature: {}", e))?;
+    let sig = repo
+        .signature()
+        .or_else(|_| git2::Signature::now("Antigravity Engine", "agent@antigravity.ai"))
+        .map_err(|e| format!("Failed to resolve signature: {}", e))?;
 
     let head_commit = match repo.head() {
         Ok(head) => Some(head.peel_to_commit().map_err(|e| e.to_string())?),
@@ -119,14 +119,7 @@ pub fn git_create_commit(path: &str, message: &str) -> Result<String, String> {
     };
 
     let commit_id = repo
-        .commit(
-            Some("HEAD"),
-            &sig,
-            &sig,
-            message,
-            &tree,
-            &parents,
-        )
+        .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
         .map_err(|e| format!("Failed to create commit: {}", e))?;
 
     Ok(commit_id.to_string())
@@ -148,7 +141,7 @@ pub fn git_create_branch(path: &str, name: &str) -> Result<(), String> {
 /// Safely switches checkout references to a specified branch.
 pub fn git_checkout_branch(path: &str, name: &str) -> Result<(), String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
-    
+
     let obj = repo
         .revparse_single(&format!("refs/heads/{}", name))
         .or_else(|_| repo.revparse_single(name))
@@ -181,7 +174,7 @@ pub fn git_rollback_to_commit(path: &str, commit_hash: &str) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::{File, create_dir_all, remove_dir_all};
+    use std::fs::{create_dir_all, remove_dir_all, File};
     use std::io::Write;
     use std::time::SystemTime;
 
@@ -236,7 +229,7 @@ mod tests {
         // 6. Test branch creation and checkout
         let current_branch = git_current_branch(temp_dir_str).unwrap();
         assert!(current_branch == "master" || current_branch == "main");
-        
+
         assert!(git_create_branch(temp_dir_str, "sandbox").is_ok());
         assert!(git_checkout_branch(temp_dir_str, "sandbox").is_ok());
         assert_eq!(git_current_branch(temp_dir_str).unwrap(), "sandbox");
