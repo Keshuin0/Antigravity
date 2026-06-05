@@ -454,9 +454,8 @@ fn parse_command_string(cmd: &str) -> Option<(String, Vec<String>)> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = cmd.chars();
 
-    while let Some(c) = chars.next() {
+    for c in cmd.chars() {
         if c == '"' {
             in_quotes = !in_quotes;
         } else if c.is_whitespace() && !in_quotes {
@@ -726,7 +725,7 @@ async fn self_healing_loop(
         let (exit_code, stderr_output) =
             run_process_and_stream(&program, &args, &workspace, tx.clone())
                 .await
-                .map_err(|e| {
+                .inspect_err(|_e| {
                     if is_git {
                         rollback_and_cleanup_git(
                             &workspace,
@@ -734,7 +733,6 @@ async fn self_healing_loop(
                             temp_branch,
                         );
                     }
-                    e
                 })?;
 
         drop(tx);
@@ -763,7 +761,7 @@ async fn self_healing_loop(
                             "[Self-Healing Engine] Merging changes back to branch '{}'...",
                             orig
                         ));
-                        if let Ok(_) = crate::git::git_checkout_branch(&workspace, orig) {
+                        if crate::git::git_checkout_branch(&workspace, orig).is_ok() {
                             for (rel_path, content) in &modified_files {
                                 let abs_path = Path::new(&workspace).join(rel_path);
                                 let _ = std::fs::write(&abs_path, content);
@@ -771,18 +769,16 @@ async fn self_healing_loop(
 
                             let paths_to_stage: Vec<String> =
                                 modified_files.iter().map(|(p, _)| p.clone()).collect();
-                            if !paths_to_stage.is_empty() {
-                                if let Ok(_) =
-                                    crate::git::git_stage_files(&workspace, paths_to_stage)
+                            if !paths_to_stage.is_empty()
+                                && crate::git::git_stage_files(&workspace, paths_to_stage).is_ok()
+                            {
+                                let commit_msg =
+                                    "fix(healing): self-healing auto-repair of compiler errors";
+                                if let Ok(hash) =
+                                    crate::git::git_create_commit(&workspace, commit_msg)
                                 {
-                                    let commit_msg =
-                                        "fix(healing): self-healing auto-repair of compiler errors";
-                                    if let Ok(hash) =
-                                        crate::git::git_create_commit(&workspace, commit_msg)
-                                    {
-                                        let _ = channel.send(format!("[Self-Healing Engine] Auto-committed repair to branch '{}': {} ({})", orig, hash, commit_msg));
-                                        commit_success = true;
-                                    }
+                                    let _ = channel.send(format!("[Self-Healing Engine] Auto-committed repair to branch '{}': {} ({})", orig, hash, commit_msg));
+                                    commit_success = true;
                                 }
                             }
                         }
@@ -812,9 +808,9 @@ async fn self_healing_loop(
             ));
 
             if is_git {
-                let _ = channel.send(format!(
-                    "[Self-Healing Engine] Rolling back workspace to clean branch..."
-                ));
+                let _ = channel.send(
+                    "[Self-Healing Engine] Rolling back workspace to clean branch...".to_string()
+                );
                 rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
 

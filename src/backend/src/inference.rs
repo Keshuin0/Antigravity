@@ -88,7 +88,7 @@ pub async fn stream_generate_content(
             let absolute_end = start_idx + line_end;
             let line_bytes = &buffer[start_idx..absolute_end];
 
-            let clean_line_bytes = if line_bytes.ends_with(&[b'\r']) {
+            let clean_line_bytes = if line_bytes.ends_with(b"\r") {
                 &line_bytes[..line_bytes.len() - 1]
             } else {
                 line_bytes
