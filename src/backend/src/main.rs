@@ -7,6 +7,7 @@ pub mod inference;
 pub mod parser;
 pub mod security;
 pub mod watcher;
+pub mod git;
 
 use crate::cache::SymbolCache;
 use crate::watcher::WatcherHandle;
@@ -628,6 +629,17 @@ fn extract_markdown_code_block(content: &str) -> String {
     }
 }
 
+fn rollback_and_cleanup_git(workspace: &str, original_branch: Option<&str>, temp_branch: &str) {
+    if let Some(orig) = original_branch {
+        let _ = crate::git::git_checkout_branch(workspace, orig);
+    }
+    if let Ok(repo) = git2::Repository::open(workspace) {
+        if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
+            let _ = branch.delete();
+        }
+    }
+}
+
 async fn self_healing_loop(
     command: String,
     channel: tauri::ipc::Channel<String>,
@@ -660,6 +672,35 @@ async fn self_healing_loop(
     let mut recursion_depth = 0;
     let max_depth = 3;
 
+    let is_git = crate::git::is_git_repo(&workspace);
+    let original_branch = if is_git {
+        crate::git::git_current_branch(&workspace).ok()
+    } else {
+        None
+    };
+    let temp_branch = "antigravity-healing-temp";
+
+    if is_git {
+        if let Ok(repo) = git2::Repository::open(&workspace) {
+            if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
+                if let Some(ref orig) = original_branch {
+                    let _ = crate::git::git_checkout_branch(&workspace, orig);
+                }
+                let _ = branch.delete();
+            }
+        }
+        
+        if let Err(e) = crate::git::git_create_branch(&workspace, temp_branch) {
+            let _ = channel.send(format!("[Self-Healing Engine] Git branch creation failed: {}", e));
+        } else {
+            if let Err(e) = crate::git::git_checkout_branch(&workspace, temp_branch) {
+                let _ = channel.send(format!("[Self-Healing Engine] Git checkout to sandbox failed: {}", e));
+            } else {
+                let _ = channel.send(format!("[Self-Healing Engine] Created and checked out sandbox branch: '{}'", temp_branch));
+            }
+        }
+    }
+
     loop {
         let (tx, rx) = tokio::sync::mpsc::channel(100);
         let channel_clone = channel.clone();
@@ -674,13 +715,66 @@ async fn self_healing_loop(
             .await;
 
         let (exit_code, stderr_output) =
-            run_process_and_stream(&program, &args, &workspace, tx.clone()).await?;
+            run_process_and_stream(&program, &args, &workspace, tx.clone()).await.map_err(|e| {
+                if is_git {
+                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                }
+                e
+            })?;
 
         drop(tx);
         let _ = batcher_handle.await;
 
         if exit_code == 0 {
             let _ = channel.send("[Self-Healing Engine] Compilation passed cleanly!".to_string());
+            
+            if is_git {
+                if let Some(orig) = &original_branch {
+                    let mut commit_success = false;
+                    
+                    if let Ok(statuses) = crate::git::git_status(&workspace) {
+                        let mut modified_files = Vec::new();
+                        for f in statuses {
+                            if f.status == "Modified" || f.status == "Untracked" {
+                                if let Ok(content) = std::fs::read_to_string(Path::new(&workspace).join(&f.path)) {
+                                    modified_files.push((f.path.clone(), content));
+                                }
+                            }
+                        }
+                        
+                        let _ = channel.send(format!("[Self-Healing Engine] Merging changes back to branch '{}'...", orig));
+                        if let Ok(_) = crate::git::git_checkout_branch(&workspace, orig) {
+                            for (rel_path, content) in &modified_files {
+                                let abs_path = Path::new(&workspace).join(rel_path);
+                                let _ = std::fs::write(&abs_path, content);
+                            }
+                            
+                            let paths_to_stage: Vec<String> = modified_files.iter().map(|(p, _)| p.clone()).collect();
+                            if !paths_to_stage.is_empty() {
+                                if let Ok(_) = crate::git::git_stage_files(&workspace, paths_to_stage) {
+                                    let commit_msg = "fix(healing): self-healing auto-repair of compiler errors";
+                                    if let Ok(hash) = crate::git::git_create_commit(&workspace, commit_msg) {
+                                        let _ = channel.send(format!("[Self-Healing Engine] Auto-committed repair to branch '{}': {} ({})", orig, hash, commit_msg));
+                                        commit_success = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if !commit_success {
+                        let _ = crate::git::git_checkout_branch(&workspace, orig);
+                    }
+                }
+                
+                // Delete temp branch
+                if let Ok(repo) = git2::Repository::open(&workspace) {
+                    if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
+                        let _ = branch.delete();
+                    }
+                }
+            }
+            
             return Ok("Compilation passed cleanly".to_string());
         }
 
@@ -690,6 +784,12 @@ async fn self_healing_loop(
                 "[Self-Healing Engine] Maximum healing attempts ({}) reached. Aborting loop.",
                 max_depth
             ));
+            
+            if is_git {
+                let _ = channel.send(format!("[Self-Healing Engine] Rolling back workspace to clean branch..."));
+                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+            }
+            
             return Err("Self-healing failed after max attempts".to_string());
         }
 
@@ -703,6 +803,9 @@ async fn self_healing_loop(
             Some(path) => path,
             None => {
                 let _ = channel.send("[Self-Healing Engine] Could not locate failing source file in logs. Self-healing aborted.".to_string());
+                if is_git {
+                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                }
                 return Err("Failed to locate target file in stderr".to_string());
             }
         };
@@ -719,6 +822,9 @@ async fn self_healing_loop(
                     "[Self-Healing Engine] Failed to read source file {}: {}",
                     file_name, e
                 ));
+                if is_git {
+                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                }
                 return Err(format!("Failed to read file: {}", e));
             }
         };
@@ -770,6 +876,9 @@ async fn self_healing_loop(
         let patched_code = extract_markdown_code_block(&collected_response);
         if patched_code.trim().is_empty() {
             let _ = channel.send("[Self-Healing Engine] Gemini returned empty or invalid patch format. Healing failed.".to_string());
+            if is_git {
+                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+            }
             return Err("Gemini returned invalid patch format".to_string());
         }
 
@@ -778,6 +887,9 @@ async fn self_healing_loop(
                 "[Self-Healing Engine] Failed to write patch to disk: {}",
                 e
             ));
+            if is_git {
+                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+            }
             return Err(format!("Failed to write patch: {}", e));
         }
 
@@ -845,6 +957,54 @@ fn get_config(state: State<'_, AppState>) -> ConfigPayload {
         workspace_root: ws,
         has_key: has_k,
     }
+}
+
+#[tauri::command]
+fn git_init_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_init(&ws)
+}
+
+#[tauri::command]
+fn git_current_branch_cmd(state: State<'_, AppState>) -> Result<String, String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_current_branch(&ws)
+}
+
+#[tauri::command]
+fn git_status_cmd(state: State<'_, AppState>) -> Result<Vec<crate::git::GitFileStatus>, String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_status(&ws)
+}
+
+#[tauri::command]
+fn git_stage_files_cmd(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_stage_files(&ws, files)
+}
+
+#[tauri::command]
+fn git_create_commit_cmd(message: String, state: State<'_, AppState>) -> Result<String, String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_create_commit(&ws, &message)
+}
+
+#[tauri::command]
+fn git_create_branch_cmd(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_create_branch(&ws, &name)
+}
+
+#[tauri::command]
+fn git_checkout_branch_cmd(name: String, state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_checkout_branch(&ws, &name)
+}
+
+#[tauri::command]
+fn git_rollback_to_commit_cmd(commit_hash: String, state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_rollback_to_commit(&ws, &commit_hash)
 }
 
 fn main() {
@@ -925,7 +1085,15 @@ fn main() {
             execute_command,
             execute_command_stream,
             index_workspace,
-            search_symbols
+            search_symbols,
+            git_init_cmd,
+            git_current_branch_cmd,
+            git_status_cmd,
+            git_stage_files_cmd,
+            git_create_commit_cmd,
+            git_create_branch_cmd,
+            git_checkout_branch_cmd,
+            git_rollback_to_commit_cmd
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
