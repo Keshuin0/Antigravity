@@ -3,11 +3,11 @@
 pub mod cache;
 pub mod db;
 pub mod embeddings;
+pub mod git;
 pub mod inference;
 pub mod parser;
 pub mod security;
 pub mod watcher;
-pub mod git;
 
 use crate::cache::SymbolCache;
 use crate::watcher::WatcherHandle;
@@ -454,9 +454,8 @@ fn parse_command_string(cmd: &str) -> Option<(String, Vec<String>)> {
     let mut args = Vec::new();
     let mut current = String::new();
     let mut in_quotes = false;
-    let mut chars = cmd.chars();
 
-    while let Some(c) = chars.next() {
+    for c in cmd.chars() {
         if c == '"' {
             in_quotes = !in_quotes;
         } else if c.is_whitespace() && !in_quotes {
@@ -689,14 +688,23 @@ async fn self_healing_loop(
                 let _ = branch.delete();
             }
         }
-        
+
         if let Err(e) = crate::git::git_create_branch(&workspace, temp_branch) {
-            let _ = channel.send(format!("[Self-Healing Engine] Git branch creation failed: {}", e));
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Git branch creation failed: {}",
+                e
+            ));
         } else {
             if let Err(e) = crate::git::git_checkout_branch(&workspace, temp_branch) {
-                let _ = channel.send(format!("[Self-Healing Engine] Git checkout to sandbox failed: {}", e));
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] Git checkout to sandbox failed: {}",
+                    e
+                ));
             } else {
-                let _ = channel.send(format!("[Self-Healing Engine] Created and checked out sandbox branch: '{}'", temp_branch));
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] Created and checked out sandbox branch: '{}'",
+                    temp_branch
+                ));
             }
         }
     }
@@ -715,58 +723,72 @@ async fn self_healing_loop(
             .await;
 
         let (exit_code, stderr_output) =
-            run_process_and_stream(&program, &args, &workspace, tx.clone()).await.map_err(|e| {
-                if is_git {
-                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
-                }
-                e
-            })?;
+            run_process_and_stream(&program, &args, &workspace, tx.clone())
+                .await
+                .inspect_err(|_e| {
+                    if is_git {
+                        rollback_and_cleanup_git(
+                            &workspace,
+                            original_branch.as_deref(),
+                            temp_branch,
+                        );
+                    }
+                })?;
 
         drop(tx);
         let _ = batcher_handle.await;
 
         if exit_code == 0 {
             let _ = channel.send("[Self-Healing Engine] Compilation passed cleanly!".to_string());
-            
+
             if is_git {
                 if let Some(orig) = &original_branch {
                     let mut commit_success = false;
-                    
+
                     if let Ok(statuses) = crate::git::git_status(&workspace) {
                         let mut modified_files = Vec::new();
                         for f in statuses {
                             if f.status == "Modified" || f.status == "Untracked" {
-                                if let Ok(content) = std::fs::read_to_string(Path::new(&workspace).join(&f.path)) {
+                                if let Ok(content) =
+                                    std::fs::read_to_string(Path::new(&workspace).join(&f.path))
+                                {
                                     modified_files.push((f.path.clone(), content));
                                 }
                             }
                         }
-                        
-                        let _ = channel.send(format!("[Self-Healing Engine] Merging changes back to branch '{}'...", orig));
-                        if let Ok(_) = crate::git::git_checkout_branch(&workspace, orig) {
+
+                        let _ = channel.send(format!(
+                            "[Self-Healing Engine] Merging changes back to branch '{}'...",
+                            orig
+                        ));
+                        if crate::git::git_checkout_branch(&workspace, orig).is_ok() {
                             for (rel_path, content) in &modified_files {
                                 let abs_path = Path::new(&workspace).join(rel_path);
                                 let _ = std::fs::write(&abs_path, content);
                             }
-                            
-                            let paths_to_stage: Vec<String> = modified_files.iter().map(|(p, _)| p.clone()).collect();
-                            if !paths_to_stage.is_empty() {
-                                if let Ok(_) = crate::git::git_stage_files(&workspace, paths_to_stage) {
-                                    let commit_msg = "fix(healing): self-healing auto-repair of compiler errors";
-                                    if let Ok(hash) = crate::git::git_create_commit(&workspace, commit_msg) {
-                                        let _ = channel.send(format!("[Self-Healing Engine] Auto-committed repair to branch '{}': {} ({})", orig, hash, commit_msg));
-                                        commit_success = true;
-                                    }
+
+                            let paths_to_stage: Vec<String> =
+                                modified_files.iter().map(|(p, _)| p.clone()).collect();
+                            if !paths_to_stage.is_empty()
+                                && crate::git::git_stage_files(&workspace, paths_to_stage).is_ok()
+                            {
+                                let commit_msg =
+                                    "fix(healing): self-healing auto-repair of compiler errors";
+                                if let Ok(hash) =
+                                    crate::git::git_create_commit(&workspace, commit_msg)
+                                {
+                                    let _ = channel.send(format!("[Self-Healing Engine] Auto-committed repair to branch '{}': {} ({})", orig, hash, commit_msg));
+                                    commit_success = true;
                                 }
                             }
                         }
                     }
-                    
+
                     if !commit_success {
                         let _ = crate::git::git_checkout_branch(&workspace, orig);
                     }
                 }
-                
+
                 // Delete temp branch
                 if let Ok(repo) = git2::Repository::open(&workspace) {
                     if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
@@ -774,7 +796,7 @@ async fn self_healing_loop(
                     }
                 }
             }
-            
+
             return Ok("Compilation passed cleanly".to_string());
         }
 
@@ -784,12 +806,14 @@ async fn self_healing_loop(
                 "[Self-Healing Engine] Maximum healing attempts ({}) reached. Aborting loop.",
                 max_depth
             ));
-            
+
             if is_git {
-                let _ = channel.send(format!("[Self-Healing Engine] Rolling back workspace to clean branch..."));
+                let _ = channel.send(
+                    "[Self-Healing Engine] Rolling back workspace to clean branch...".to_string(),
+                );
                 rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
-            
+
             return Err("Self-healing failed after max attempts".to_string());
         }
 
@@ -968,14 +992,12 @@ struct VfsEntry {
 
 #[tauri::command]
 fn read_workspace_file_cmd(path: String) -> Result<String, String> {
-    std::fs::read_to_string(&path)
-        .map_err(|e| format!("Failed to read file: {}", e))
+    std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
 #[tauri::command]
 fn write_workspace_file_cmd(path: String, content: String) -> Result<(), String> {
-    std::fs::write(&path, content)
-        .map_err(|e| format!("Failed to write file: {}", e))
+    std::fs::write(&path, content).map_err(|e| format!("Failed to write file: {}", e))
 }
 
 #[tauri::command]
@@ -985,21 +1007,28 @@ fn read_workspace_dir_cmd(path: String) -> Result<Vec<VfsEntry>, String> {
     if !dir.is_dir() {
         return Err("Not a directory".to_string());
     }
-    
+
     if let Ok(read_dir) = std::fs::read_dir(dir) {
         for entry in read_dir.flatten() {
             let entry_path = entry.path();
             let is_dir = entry_path.is_dir();
-            let name = entry_path.file_name()
+            let name = entry_path
+                .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            
+
             // Skip common build/temp folders to keep tree high-performance
-            if is_dir && (name == ".git" || name == "node_modules" || name == "target" || name == "dist" || name == ".next") {
+            if is_dir
+                && (name == ".git"
+                    || name == "node_modules"
+                    || name == "target"
+                    || name == "dist"
+                    || name == ".next")
+            {
                 continue;
             }
-            
+
             entries.push(VfsEntry {
                 name,
                 path: entry_path.to_string_lossy().to_string(),
@@ -1007,7 +1036,7 @@ fn read_workspace_dir_cmd(path: String) -> Result<Vec<VfsEntry>, String> {
             });
         }
     }
-    
+
     // Sort directories first, then files alphabetically
     entries.sort_by(|a, b| {
         if a.is_dir && !b.is_dir {
@@ -1018,7 +1047,7 @@ fn read_workspace_dir_cmd(path: String) -> Result<Vec<VfsEntry>, String> {
             a.name.to_lowercase().cmp(&b.name.to_lowercase())
         }
     });
-    
+
     Ok(entries)
 }
 
@@ -1065,7 +1094,10 @@ fn git_checkout_branch_cmd(name: String, state: State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
-fn git_rollback_to_commit_cmd(commit_hash: String, state: State<'_, AppState>) -> Result<(), String> {
+fn git_rollback_to_commit_cmd(
+    commit_hash: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let ws = state.workspace_root.lock().unwrap().clone();
     crate::git::git_rollback_to_commit(&ws, &commit_hash)
 }
