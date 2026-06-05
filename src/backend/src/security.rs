@@ -1,8 +1,7 @@
-use std::ptr;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[cfg(target_os = "windows")]
-use std::os::raw::c_void;
+use std::{os::raw::c_void, ptr};
 
 #[derive(Zeroize, ZeroizeOnDrop, Clone)]
 pub struct ObfBox {
