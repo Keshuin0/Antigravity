@@ -809,7 +809,7 @@ async fn self_healing_loop(
 
             if is_git {
                 let _ = channel.send(
-                    "[Self-Healing Engine] Rolling back workspace to clean branch...".to_string()
+                    "[Self-Healing Engine] Rolling back workspace to clean branch...".to_string(),
                 );
                 rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
