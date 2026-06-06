@@ -176,7 +176,7 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     };
 
     let mut child = std::process::Command::new(&npm_bin)
-        .args(&[
+        .args([
             "install",
             "--prefix",
             &local_servers_dir.to_string_lossy(),
@@ -243,8 +243,8 @@ fn apply_incremental_edit(
     let end_byte = utf16_char_to_utf8_byte_offset(lines[end_line], end_char)?;
 
     let mut new_content = String::new();
-    for i in 0..start_line {
-        new_content.push_str(lines[i]);
+    for line in lines.iter().take(start_line) {
+        new_content.push_str(line);
         new_content.push('\n');
     }
 
@@ -255,9 +255,9 @@ fn apply_incremental_edit(
     let end_line_str = lines[end_line];
     new_content.push_str(&end_line_str[end_byte..]);
 
-    for i in (end_line + 1)..lines.len() {
+    for line in lines.iter().skip(end_line + 1) {
         new_content.push('\n');
-        new_content.push_str(lines[i]);
+        new_content.push_str(line);
     }
 
     *content = new_content;
@@ -761,25 +761,32 @@ impl LspClient {
             "contentChanges": [change]
         });
 
+        let mut patch_error = None;
         // Update stored contents for self-healing registry
         {
             let mut files = self.open_files.lock().unwrap();
             if let Some(content) = files.get_mut(path) {
                 if let Some(ref r) = range {
                     if let Err(e) = apply_incremental_edit(content, r, text) {
-                        let _ = self.send_notification(
-                            "telemetry/event",
-                            json!({
-                                "type": "error",
-                                "message": format!("LSP Incremental patch failed: {}", e)
-                            }),
-                        );
+                        patch_error = Some(format!("LSP Incremental patch failed: {}", e));
                     }
                 } else {
                     // Full sync update
                     *content = text.to_string();
                 }
             }
+        }
+
+        if let Some(err_msg) = patch_error {
+            let _ = self
+                .send_notification(
+                    "telemetry/event",
+                    json!({
+                        "type": "error",
+                        "message": err_msg
+                    }),
+                )
+                .await;
         }
 
         self.send_notification("textDocument/didChange", params)

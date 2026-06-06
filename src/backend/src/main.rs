@@ -728,8 +728,7 @@ struct LlmPatchResponse {
 fn strip_ansi_escapes(s: &str) -> String {
     let mut result = String::new();
     let mut in_escape = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in s.chars() {
         if c == '\x1b' {
             in_escape = true;
         } else if in_escape {
@@ -1122,7 +1121,7 @@ fn extract_json_from_response(s: &str) -> String {
         cleaned = cleaned
             .trim_start_matches('`')
             .trim_start_matches("json")
-            .trim_start_matches(|c| c == '\n' || c == '\r');
+            .trim_start_matches(['\n', '\r']);
         if let Some(end_pos) = cleaned.rfind("```") {
             cleaned = &cleaned[..end_pos];
         }
@@ -1404,7 +1403,7 @@ async fn self_healing_loop(
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let file_content = match std::fs::read_to_string(&file_path) {
+        let file_content = match std::fs::read_to_string(file_path) {
             Ok(content) => content,
             Err(e) => {
                 let _ = channel.send(format!(
@@ -1442,7 +1441,7 @@ async fn self_healing_loop(
                     line,
                     col
                 ));
-                match try_lsp_quickfix(&client, &file_path, line, col, &channel).await {
+                match try_lsp_quickfix(&client, file_path, line, col, &channel).await {
                     Ok(true) => {
                         quickfix_applied = true;
                     }
@@ -1468,7 +1467,7 @@ async fn self_healing_loop(
         }
 
         // Run Tree-sitter Scope Isolation
-        let isolated_scope = crate::parser::isolate_ast_scope(&file_path, &file_content, line, col);
+        let isolated_scope = crate::parser::isolate_ast_scope(file_path, &file_content, line, col);
 
         // Build Cross-Reference RAG Context using database symbol index
         let mut rag_context = String::new();
@@ -1622,7 +1621,7 @@ async fn self_healing_loop(
                             .replace_range(scope.start_byte..scope.end_byte, &patch.patched_code);
                         insert_imports_to_source(&mut new_content, &patch.new_imports, syntax_lang);
 
-                        if let Err(e) = std::fs::write(&file_path, &new_content) {
+                        if let Err(e) = std::fs::write(file_path, &new_content) {
                             let _ = channel.send(format!(
                                 "[Self-Healing Engine] Failed to write patched file to disk: {}",
                                 e
@@ -1643,7 +1642,7 @@ async fn self_healing_loop(
                         applied = true;
                     }
                 } else {
-                    if let Err(e) = std::fs::write(&file_path, &patch.patched_code) {
+                    if let Err(e) = std::fs::write(file_path, &patch.patched_code) {
                         let _ = channel.send(format!(
                             "[Self-Healing Engine] Failed to write patched file to disk: {}",
                             e
@@ -1673,7 +1672,7 @@ async fn self_healing_loop(
             let fallback_code = extract_markdown_code_block(&collected_response);
             if !fallback_code.trim().is_empty() {
                 let _ = channel.send("[Self-Healing Engine] JSON parsing or syntax validation failed. Falling back to full-file markdown block replacement...".to_string());
-                if let Err(e) = std::fs::write(&file_path, &fallback_code) {
+                if let Err(e) = std::fs::write(file_path, &fallback_code) {
                     let _ = channel.send(format!(
                         "[Self-Healing Engine] Failed to write fallback patch to disk: {}",
                         e
@@ -2200,8 +2199,8 @@ fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Resu
     let end_byte = utf16_char_to_utf8_byte_offset_main(lines[edit.end_line], edit.end_char)?;
 
     let mut new_content = String::new();
-    for i in 0..edit.start_line {
-        new_content.push_str(lines[i]);
+    for line in lines.iter().take(edit.start_line) {
+        new_content.push_str(line);
         new_content.push('\n');
     }
 
@@ -2212,9 +2211,9 @@ fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Resu
     let end_line_str = lines[edit.end_line];
     new_content.push_str(&end_line_str[end_byte..]);
 
-    for i in (edit.end_line + 1)..lines.len() {
+    for line in lines.iter().skip(edit.end_line + 1) {
         new_content.push('\n');
-        new_content.push_str(lines[i]);
+        new_content.push_str(line);
     }
 
     *content = new_content;
