@@ -247,7 +247,10 @@ pub fn load_secure_token(key_name: &str) -> Result<ObfBox, String> {
     } else if let Ok(key) = std::env::var(key_name.to_uppercase()) {
         Ok(ObfBox::new(key.as_bytes()))
     } else {
-        Err(format!("Keyring entry {} not found in environment", env_var))
+        Err(format!(
+            "Keyring entry {} not found in environment",
+            env_var
+        ))
     }
 }
 

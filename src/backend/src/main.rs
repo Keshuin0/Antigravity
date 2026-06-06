@@ -5,11 +5,10 @@ pub mod db;
 pub mod embeddings;
 pub mod git;
 pub mod inference;
+pub mod lsp;
 pub mod parser;
 pub mod security;
 pub mod watcher;
-pub mod lsp;
-
 
 use crate::cache::SymbolCache;
 use crate::watcher::WatcherHandle;
@@ -28,9 +27,10 @@ pub struct AppState {
     pub symbol_cache: std::sync::Arc<Mutex<SymbolCache>>,
     pub watcher_handle: std::sync::Arc<Mutex<Option<WatcherHandle>>>,
     pub db_conn: std::sync::Arc<Mutex<Option<rusqlite::Connection>>>,
-    pub lsp_clients: std::sync::Arc<Mutex<Option<std::collections::HashMap<String, std::sync::Arc<lsp::LspClient>>>>>,
+    pub lsp_clients: std::sync::Arc<
+        Mutex<Option<std::collections::HashMap<String, std::sync::Arc<lsp::LspClient>>>>,
+    >,
 }
-
 
 impl Default for AppState {
     fn default() -> Self {
@@ -55,7 +55,6 @@ impl Default for AppState {
             db_conn: std::sync::Arc::new(Mutex::new(None)),
             lsp_clients: std::sync::Arc::new(Mutex::new(Some(std::collections::HashMap::new()))),
         }
-
     }
 }
 
@@ -155,7 +154,9 @@ async fn index_file(
     }
 
     let texts: Vec<String> = symbols_to_embed.iter().map(|s| s.content.clone()).collect();
-    let embeddings = embeddings::get_embeddings_batch_multiplexed(provider, endpoint, model, api_token, &texts).await?;
+    let embeddings =
+        embeddings::get_embeddings_batch_multiplexed(provider, endpoint, model, api_token, &texts)
+            .await?;
 
     {
         let mut db_lock = conn_mutex.lock().unwrap();
@@ -238,18 +239,28 @@ fn save_config(
 
     // 2. Persist api_token to OS Keyring securely (or delete if empty)
     let mut logs = state.logs.lock().unwrap();
-    let key_name = if llm_provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+    let key_name = if llm_provider == "openai" {
+        "openai_api_key"
+    } else {
+        "gemini_api_key"
+    };
 
     if api_token.trim().is_empty() {
         let _ = crate::security::delete_secure_token(key_name);
         *state.api_token.lock().unwrap() = None;
-        logs.push(format!("Security: API Key for '{}' deleted from secure storage.", key_name));
+        logs.push(format!(
+            "Security: API Key for '{}' deleted from secure storage.",
+            key_name
+        ));
     } else if !api_token.starts_with('•') && !api_token.starts_with("•••") {
         match crate::security::save_secure_token(key_name, &api_token) {
             Ok(_) => {
                 let obf = crate::security::ObfBox::new(api_token.as_bytes());
                 *state.api_token.lock().unwrap() = Some(obf);
-                logs.push(format!("Security: Saved API Key for '{}' to OS Keyring successfully.", key_name));
+                logs.push(format!(
+                    "Security: Saved API Key for '{}' to OS Keyring successfully.",
+                    key_name
+                ));
             }
             Err(e) => {
                 logs.push(format!(
@@ -377,13 +388,21 @@ async fn index_workspace(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 let mut key_lock = state.api_token.lock().unwrap();
                 *key_lock = Some(obf.clone());
                 obf
             } else {
-                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
                 if let Ok(env_key) = std::env::var(env_name) {
                     let obf = crate::security::ObfBox::new(env_key.as_bytes());
                     let mut key_lock = state.api_token.lock().unwrap();
@@ -447,7 +466,9 @@ async fn index_workspace(
                 endpoint_clone.as_deref(),
                 model_clone.as_deref(),
                 &final_api_key,
-            ).await {
+            )
+            .await
+            {
                 Ok(count) => {
                     if count > 0 {
                         updated_count += count;
@@ -507,13 +528,21 @@ async fn search_symbols(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 let mut key_lock = state.api_token.lock().unwrap();
                 *key_lock = Some(obf.clone());
                 obf
             } else {
-                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
                 if let Ok(env_key) = std::env::var(env_name) {
                     let obf = crate::security::ObfBox::new(env_key.as_bytes());
                     let mut key_lock = state.api_token.lock().unwrap();
@@ -774,13 +803,21 @@ async fn self_healing_loop(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 let mut key_lock = state.api_token.lock().unwrap();
                 *key_lock = Some(obf.clone());
                 obf
             } else {
-                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
                 if let Ok(env_key) = std::env::var(env_name) {
                     let obf = crate::security::ObfBox::new(env_key.as_bytes());
                     let mut key_lock = state.api_token.lock().unwrap();
@@ -895,7 +932,7 @@ async fn self_healing_loop(
                         if crate::git::git_checkout_branch(&workspace, orig).is_ok() {
                             for (rel_path, content) in &modified_files {
                                 let abs_path = Path::new(&workspace).join(rel_path);
-                                  let _ = std::fs::write(&abs_path, content);
+                                let _ = std::fs::write(&abs_path, content);
                             }
 
                             let paths_to_stage: Vec<String> =
@@ -1022,17 +1059,17 @@ async fn self_healing_loop(
         let attachments_clone = attachments.clone();
 
         tokio::spawn(async move {
-            let _ =
-                crate::inference::stream_generate_content_multiplexed(
-                    &provider_clone,
-                    endpoint_clone.as_deref(),
-                    model_clone.as_deref(),
-                    &api_key_clone,
-                    &prompt,
-                    attachments_clone,
-                    api_tx,
-                    Some(app_handle_clone),
-                ).await;
+            let _ = crate::inference::stream_generate_content_multiplexed(
+                &provider_clone,
+                endpoint_clone.as_deref(),
+                model_clone.as_deref(),
+                &api_key_clone,
+                &prompt,
+                attachments_clone,
+                api_tx,
+                Some(app_handle_clone),
+            )
+            .await;
         });
 
         while let Some(token) = api_rx.recv().await {
@@ -1045,7 +1082,10 @@ async fn self_healing_loop(
 
         let patched_code = extract_markdown_code_block(&collected_response);
         if patched_code.trim().is_empty() {
-            let _ = channel.send("[Self-Healing Engine] LLM returned empty or invalid patch format. Healing failed.".to_string());
+            let _ = channel.send(
+                "[Self-Healing Engine] LLM returned empty or invalid patch format. Healing failed."
+                    .to_string(),
+            );
             if is_git {
                 rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
@@ -1277,7 +1317,7 @@ async fn lsp_start(
     }
 
     let client = lsp::LspClient::start(&language, &root_path, app_handle)?;
-    
+
     // Initialize the server
     let root_uri = format!("file:///{}", root_path.replace('\\', "/"));
     client.initialize(&root_uri).await?;
@@ -1300,7 +1340,9 @@ async fn lsp_file_open(
     let client = {
         let clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language).cloned().ok_or("LSP server not running")?
+        map.get(&language)
+            .cloned()
+            .ok_or("LSP server not running")?
     };
 
     client.file_open(&path, &content).await
@@ -1317,7 +1359,9 @@ async fn lsp_file_change(
     let client = {
         let clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language).cloned().ok_or("LSP server not running")?
+        map.get(&language)
+            .cloned()
+            .ok_or("LSP server not running")?
     };
 
     client.file_change(&path, range, &text).await
@@ -1333,12 +1377,13 @@ async fn lsp_file_save(
     let client = {
         let clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language).cloned().ok_or("LSP server not running")?
+        map.get(&language)
+            .cloned()
+            .ok_or("LSP server not running")?
     };
 
     client.file_save(&path, content.as_deref()).await
 }
-
 
 #[tauri::command]
 async fn lsp_send_request(
@@ -1350,17 +1395,16 @@ async fn lsp_send_request(
     let client = {
         let clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language).cloned().ok_or("LSP server not running")?
+        map.get(&language)
+            .cloned()
+            .ok_or("LSP server not running")?
     };
 
     client.send_request(&method, params).await
 }
 
 #[tauri::command]
-async fn lsp_shutdown(
-    language: String,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+async fn lsp_shutdown(language: String, state: State<'_, AppState>) -> Result<(), String> {
     let client = {
         let mut clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
@@ -1370,7 +1414,6 @@ async fn lsp_shutdown(
     client.shutdown().await
 }
 
-
 #[derive(serde::Serialize)]
 struct TestConnectionResult {
     success: bool,
@@ -1379,9 +1422,7 @@ struct TestConnectionResult {
 }
 
 #[tauri::command]
-async fn test_llm_connection(
-    state: State<'_, AppState>,
-) -> Result<TestConnectionResult, String> {
+async fn test_llm_connection(state: State<'_, AppState>) -> Result<TestConnectionResult, String> {
     let provider = state.llm_provider.lock().unwrap().clone();
     let endpoint = state.llm_endpoint.lock().unwrap().clone();
     let model = state.llm_model.lock().unwrap().clone();
@@ -1390,11 +1431,19 @@ async fn test_llm_connection(
     let api_key = match obf_key_opt {
         Some(k) => k,
         None => {
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 obf
             } else {
-                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
                 if let Ok(env_key) = std::env::var(env_name) {
                     crate::security::ObfBox::new(env_key.as_bytes())
                 } else {
@@ -1425,7 +1474,8 @@ async fn test_llm_connection(
             None,
             tx,
             None,
-        ).await
+        )
+        .await
     });
 
     let mut got_response = false;
@@ -1465,7 +1515,11 @@ async fn discover_models(
     let key = if let Some(ref k) = api_key_str {
         if k.starts_with('•') || k.starts_with("•••") {
             let provider = state.llm_provider.lock().unwrap().clone();
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 let decrypted = obf.decrypt();
                 String::from_utf8(decrypted).unwrap_or_default()
@@ -1507,10 +1561,12 @@ async fn discover_models(
         req = req.bearer_auth(&key);
     }
 
-    let response = req
-        .send()
-        .await
-        .map_err(|e| format!("Failed to connect to autodiscovery endpoint ({}): {}", models_url, e))?;
+    let response = req.send().await.map_err(|e| {
+        format!(
+            "Failed to connect to autodiscovery endpoint ({}): {}",
+            models_url, e
+        )
+    })?;
 
     let status = response.status();
     if !status.is_success() {
@@ -1555,9 +1611,8 @@ fn sniff_mime_type_helper(bytes: &[u8], extension: &str) -> String {
             "webp" => "image/webp".to_string(),
             "gif" => "image/gif".to_string(),
             "pdf" => "application/pdf".to_string(),
-            "txt" | "log" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "csv" | "md" | "toml" | "yaml" | "yml" | "css" | "html" => {
-                "text/plain".to_string()
-            }
+            "txt" | "log" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "csv" | "md" | "toml"
+            | "yaml" | "yml" | "css" | "html" => "text/plain".to_string(),
             _ => {
                 if std::str::from_utf8(bytes).is_ok() {
                     "text/plain".to_string()
@@ -1590,12 +1645,10 @@ fn sniff_file_type(path: String) -> Result<FileSniffResult, String> {
     if !file_path.exists() {
         return Err(format!("File does not exist: {}", path));
     }
-    let metadata = std::fs::metadata(file_path).map_err(|e| format!("Failed to read metadata: {}", e))?;
+    let metadata =
+        std::fs::metadata(file_path).map_err(|e| format!("Failed to read metadata: {}", e))?;
     let bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-    let extension = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mime_type = sniff_mime_type_helper(&bytes, extension);
     Ok(FileSniffResult {
         mime_type,
@@ -1610,14 +1663,10 @@ fn extract_document_text(path: String) -> Result<String, String> {
         return Err(format!("File does not exist: {}", path));
     }
     let bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
-    let extension = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
     let mime_type = sniff_mime_type_helper(&bytes, extension);
     if mime_type == "application/pdf" {
-        pdf_extract::extract_text(&path)
-            .map_err(|e| format!("Failed to extract PDF text: {}", e))
+        pdf_extract::extract_text(&path).map_err(|e| format!("Failed to extract PDF text: {}", e))
     } else {
         match String::from_utf8(bytes) {
             Ok(text) => Ok(text),
@@ -1627,67 +1676,72 @@ fn extract_document_text(path: String) -> Result<String, String> {
 }
 
 #[tauri::command]
-async fn upload_file_to_gemini(
-    path: String,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn upload_file_to_gemini(path: String, state: State<'_, AppState>) -> Result<String, String> {
     let file_path = Path::new(&path);
     if !file_path.exists() {
         return Err(format!("File does not exist: {}", path));
     }
-    
+
     let file_bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
     let display_name = file_path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-        
-    let extension = file_path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-        
+
+    let extension = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+
     let mime_type = sniff_mime_type_helper(&file_bytes, extension);
-    
+
     // Obtain API key
     let provider = state.llm_provider.lock().unwrap().clone();
     let api_key_obf = {
         let key = state.api_token.lock().unwrap();
         key.clone()
     };
-    
+
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 obf
             } else {
-                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
                 if let Ok(env_key) = std::env::var(env_name) {
                     crate::security::ObfBox::new(env_key.as_bytes())
                 } else {
-                    return Err(format!("API Key is not configured for provider '{}'.", provider));
+                    return Err(format!(
+                        "API Key is not configured for provider '{}'.",
+                        provider
+                    ));
                 }
             }
         }
     };
-    
+
     use zeroize::Zeroizing;
     let decrypted_key = Zeroizing::new(final_api_key.decrypt());
-    let key_str = std::str::from_utf8(&decrypted_key)
-        .map_err(|e| format!("Invalid API key: {}", e))?;
-        
+    let key_str =
+        std::str::from_utf8(&decrypted_key).map_err(|e| format!("Invalid API key: {}", e))?;
+
     let client = crate::embeddings::build_http_client();
     let url = format!(
         "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
         key_str
     );
-    
+
     let boundary = "antigravity_multipart_boundary_12345";
     let mut body = Vec::new();
-    
+
     // Part 1: Metadata
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
@@ -1698,45 +1752,51 @@ async fn upload_file_to_gemini(
     });
     body.extend_from_slice(metadata.to_string().as_bytes());
     body.extend_from_slice(b"\r\n");
-    
+
     // Part 2: Data
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", mime_type).as_bytes());
     body.extend_from_slice(&file_bytes);
     body.extend_from_slice(b"\r\n");
-    
+
     // End
     body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
-    
+
     let response = client
         .post(&url)
-        .header("Content-Type", format!("multipart/related; boundary={}", boundary))
+        .header(
+            "Content-Type",
+            format!("multipart/related; boundary={}", boundary),
+        )
         .body(body)
         .send()
         .await
         .map_err(|e| format!("Failed to send upload request: {}", e))?;
-        
+
     let status = response.status();
     if !status.is_success() {
         let err_text = response.text().await.unwrap_or_default();
-        return Err(format!("Gemini Files API upload failed ({}): {}", status, err_text));
+        return Err(format!(
+            "Gemini Files API upload failed ({}): {}",
+            status, err_text
+        ));
     }
-    
+
     #[derive(serde::Deserialize)]
     struct FileInfo {
         uri: String,
     }
-    
+
     #[derive(serde::Deserialize)]
     struct GeminiUploadResponse {
         file: FileInfo,
     }
-    
+
     let result: GeminiUploadResponse = response
         .json()
         .await
         .map_err(|e| format!("Failed to parse upload response JSON: {}", e))?;
-        
+
     Ok(result.file.uri)
 }
 

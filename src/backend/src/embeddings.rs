@@ -226,7 +226,10 @@ pub async fn get_embedding_multiplexed(
         let status = response.status();
         if !status.is_success() {
             let err_text = response.text().await.unwrap_or_default();
-            return Err(format!("OpenAI Embeddings API error ({}): {}", status, err_text));
+            return Err(format!(
+                "OpenAI Embeddings API error ({}): {}",
+                status, err_text
+            ));
         }
 
         let result: OpenAIEmbedResponse = response
@@ -290,7 +293,10 @@ pub async fn get_embeddings_batch_multiplexed(
             let status = response.status();
             if !status.is_success() {
                 let err_text = response.text().await.unwrap_or_default();
-                return Err(format!("OpenAI Embeddings API error ({}): {}", status, err_text));
+                return Err(format!(
+                    "OpenAI Embeddings API error ({}): {}",
+                    status, err_text
+                ));
             }
 
             let result: OpenAIEmbedResponse = response
@@ -317,4 +323,3 @@ pub async fn get_embeddings_batch_multiplexed(
         Ok(results)
     }
 }
-
