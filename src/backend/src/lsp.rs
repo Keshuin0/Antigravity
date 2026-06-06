@@ -1,11 +1,11 @@
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
-use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Clone, serde::Serialize)]
 struct LspDiagnosticPayload {
@@ -13,6 +13,7 @@ struct LspDiagnosticPayload {
     diagnostics: Value,
 }
 
+#[allow(clippy::type_complexity)]
 pub struct LspClient {
     stdin_tx: mpsc::Sender<Value>,
     request_counter: AtomicU64,
@@ -146,10 +147,7 @@ impl LspClient {
                         Err(e) => {
                             let state = app_handle_out.state::<crate::AppState>();
                             let mut logs = state.logs.lock().unwrap();
-                            logs.push(format!(
-                                "LSP [{}] reader read error: {}",
-                                lang_name_out, e
-                            ));
+                            logs.push(format!("LSP [{}] reader read error: {}", lang_name_out, e));
                             return;
                         }
                     }
@@ -331,11 +329,7 @@ impl LspClient {
         Ok(client)
     }
 
-    pub async fn send_request(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<Value, String> {
+    pub async fn send_request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.request_counter.fetch_add(1, Ordering::SeqCst);
         let payload = json!({
             "jsonrpc": "2.0",
@@ -355,15 +349,10 @@ impl LspClient {
             .await
             .map_err(|e| format!("Failed to queue stdin payload request: {}", e))?;
 
-        rx.await
-            .map_err(|e| format!("Request cancelled: {}", e))?
+        rx.await.map_err(|e| format!("Request cancelled: {}", e))?
     }
 
-    pub async fn send_notification(
-        &self,
-        method: &str,
-        params: Value,
-    ) -> Result<(), String> {
+    pub async fn send_notification(&self, method: &str, params: Value) -> Result<(), String> {
         let payload = json!({
             "jsonrpc": "2.0",
             "method": method,
@@ -478,7 +467,8 @@ impl LspClient {
             }
         }
 
-        self.send_notification("textDocument/didChange", params).await
+        self.send_notification("textDocument/didChange", params)
+            .await
     }
 
     pub async fn file_save(&self, path: &str, content: Option<&str>) -> Result<(), String> {

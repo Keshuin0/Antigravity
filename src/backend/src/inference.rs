@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
-use zeroize::Zeroizing;
 use std::path::Path;
+use zeroize::Zeroizing;
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
 pub struct Attachment {
     pub mime_type: String,
-    pub data: String, // Hex/Base64 data or Gemini File URI
+    pub data: String,         // Hex/Base64 data or Gemini File URI
     pub path: Option<String>, // Optional local file path for zero-copy native reading
 }
 
@@ -103,18 +103,10 @@ pub async fn stream_generate_content(
     prompt: &str,
     tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<(), String> {
-    stream_generate_content_multiplexed(
-        "gemini",
-        None,
-        None,
-        api_key,
-        prompt,
-        None,
-        tx,
-        None,
-    ).await
+    stream_generate_content_multiplexed("gemini", None, None, api_key, prompt, None, tx, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_generate_content_multiplexed(
     provider: &str,
     endpoint: Option<&str>,
@@ -132,8 +124,8 @@ pub async fn stream_generate_content_multiplexed(
     let client = crate::embeddings::build_http_client();
 
     let decrypted_key = Zeroizing::new(api_key.decrypt());
-    let key_str = std::str::from_utf8(&decrypted_key)
-        .map_err(|e| format!("Invalid API key: {}", e))?;
+    let key_str =
+        std::str::from_utf8(&decrypted_key).map_err(|e| format!("Invalid API key: {}", e))?;
 
     let mut appended_text_context = String::new();
     let mut gemini_parts = vec![GeminiContentPart::Text {
@@ -157,19 +149,21 @@ pub async fn stream_generate_content_multiplexed(
                 (att.mime_type.clone(), decoded, false)
             };
 
-            let is_text = mime.starts_with("text/") || 
-                          mime == "application/json" || 
-                          mime == "application/javascript" || 
-                          mime == "text/plain";
+            let is_text = mime.starts_with("text/")
+                || mime == "application/json"
+                || mime == "application/javascript"
+                || mime == "text/plain";
 
             if is_text {
                 if let Some(ref b) = bytes {
                     if let Ok(text_content) = String::from_utf8(b.clone()) {
-                        let filename = att.path.as_ref()
+                        let filename = att
+                            .path
+                            .as_ref()
                             .and_then(|p| Path::new(p).file_name())
                             .map(|f| f.to_string_lossy().to_string())
                             .unwrap_or_else(|| "attachment".to_string());
-                        
+
                         appended_text_context.push_str(&format!(
                             "\n\n[Attached Document: {}]\n---\n{}\n---\n",
                             filename, text_content
@@ -180,12 +174,15 @@ pub async fn stream_generate_content_multiplexed(
             }
 
             if provider == "gemini" {
-                if att.data.starts_with("https://generativelanguage.googleapis.com") {
+                if att
+                    .data
+                    .starts_with("https://generativelanguage.googleapis.com")
+                {
                     gemini_parts.push(GeminiContentPart::FileData {
                         file_data: FileData {
                             file_uri: att.data.clone(),
                             mime_type: mime,
-                        }
+                        },
                     });
                 } else if is_local && bytes.is_some() {
                     let base_64 = base64_encode(bytes.as_ref().unwrap());
@@ -193,21 +190,24 @@ pub async fn stream_generate_content_multiplexed(
                         inline_data: InlineData {
                             mime_type: mime,
                             data: base_64,
-                        }
+                        },
                     });
                 } else if !att.data.is_empty() {
                     gemini_parts.push(GeminiContentPart::InlineData {
                         inline_data: InlineData {
                             mime_type: mime,
                             data: att.data.clone(),
-                        }
+                        },
                     });
                 }
             } else {
                 // OpenAI / Local VLM
                 if mime.starts_with("image/") {
-                    let base_64 = if is_local && bytes.is_some() {
-                        base64_encode(bytes.as_ref().unwrap())
+                    let base_64 = if is_local {
+                        bytes
+                            .as_ref()
+                            .map(|b| base64_encode(b))
+                            .unwrap_or_else(|| att.data.clone())
                     } else {
                         att.data.clone()
                     };
@@ -234,11 +234,13 @@ pub async fn stream_generate_content_multiplexed(
                     };
 
                     if let Some(text_content) = extracted {
-                        let filename = att.path.as_ref()
+                        let filename = att
+                            .path
+                            .as_ref()
                             .and_then(|p| Path::new(p).file_name())
                             .map(|f| f.to_string_lossy().to_string())
                             .unwrap_or_else(|| "attachment".to_string());
-                        
+
                         appended_text_context.push_str(&format!(
                             "\n\n[Attached Document: {}]\n---\n{}\n---\n",
                             filename, text_content
@@ -382,20 +384,28 @@ pub async fn stream_generate_content_multiplexed(
     }
 
     // Report TPS
-    let elapsed = first_token_time.map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
-    let tps = if elapsed > 0.0 { token_count as f64 / elapsed } else { 0.0 };
+    let elapsed = first_token_time
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0);
+    let tps = if elapsed > 0.0 {
+        token_count as f64 / elapsed
+    } else {
+        0.0
+    };
     if let Some(ref handle) = app_handle {
         use tauri::Emitter;
         let _ = handle.emit("llm-tps", tps);
     }
 
     // Send a final log message to telemetry stream containing metrics
-    if first_token_time.is_some() {
-        let ttft = first_token_time.unwrap().duration_since(start_time).as_secs_f64();
-        let _ = tx.send(format!(
-            "\n\n[Self-Healing Engine] [Telemetry] TTFT: {:.3}s | Speed: {:.2} tokens/sec",
-            ttft, tps
-        )).await;
+    if let Some(t_time) = first_token_time {
+        let ttft = t_time.duration_since(start_time).as_secs_f64();
+        let _ = tx
+            .send(format!(
+                "\n\n[Self-Healing Engine] [Telemetry] TTFT: {:.3}s | Speed: {:.2} tokens/sec",
+                ttft, tps
+            ))
+            .await;
     }
 
     Ok(())
@@ -460,13 +470,15 @@ fn trim_byte_slice(mut slice: &[u8]) -> &[u8] {
 }
 
 fn base64_encode(bytes: &[u8]) -> String {
-    use base64::{Engine as _, engine::general_purpose};
+    use base64::{engine::general_purpose, Engine as _};
     general_purpose::STANDARD.encode(bytes)
 }
 
 fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
-    use base64::{Engine as _, engine::general_purpose};
-    general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())
+    use base64::{engine::general_purpose, Engine as _};
+    general_purpose::STANDARD
+        .decode(s)
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
