@@ -13,6 +13,7 @@ struct LspDiagnosticPayload {
     diagnostics: Value,
 }
 
+#[allow(clippy::type_complexity)]
 pub struct LspClient {
     stdin_tx: mpsc::Sender<Value>,
     request_counter: AtomicU64,

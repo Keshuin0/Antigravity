@@ -106,6 +106,7 @@ pub async fn stream_generate_content(
     stream_generate_content_multiplexed("gemini", None, None, api_key, prompt, None, tx, None).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn stream_generate_content_multiplexed(
     provider: &str,
     endpoint: Option<&str>,
@@ -202,8 +203,11 @@ pub async fn stream_generate_content_multiplexed(
             } else {
                 // OpenAI / Local VLM
                 if mime.starts_with("image/") {
-                    let base_64 = if is_local && bytes.is_some() {
-                        base64_encode(bytes.as_ref().unwrap())
+                    let base_64 = if is_local {
+                        bytes
+                            .as_ref()
+                            .map(|b| base64_encode(b))
+                            .unwrap_or_else(|| att.data.clone())
                     } else {
                         att.data.clone()
                     };
@@ -394,11 +398,8 @@ pub async fn stream_generate_content_multiplexed(
     }
 
     // Send a final log message to telemetry stream containing metrics
-    if first_token_time.is_some() {
-        let ttft = first_token_time
-            .unwrap()
-            .duration_since(start_time)
-            .as_secs_f64();
+    if let Some(t_time) = first_token_time {
+        let ttft = t_time.duration_since(start_time).as_secs_f64();
         let _ = tx
             .send(format!(
                 "\n\n[Self-Healing Engine] [Telemetry] TTFT: {:.3}s | Speed: {:.2} tokens/sec",

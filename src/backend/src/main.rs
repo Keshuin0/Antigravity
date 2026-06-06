@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
 
+#[allow(clippy::type_complexity)]
 pub struct AppState {
     pub workspace_root: std::sync::Arc<Mutex<String>>,
     pub llm_provider: std::sync::Arc<Mutex<String>>,
