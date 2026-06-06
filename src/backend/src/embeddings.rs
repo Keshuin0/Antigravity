@@ -55,13 +55,21 @@ struct OpenAIEmbedResponse {
     data: Vec<OpenAIEmbedData>,
 }
 
-pub fn build_http_client() -> reqwest::Client {
+pub fn build_http_client(accept_invalid_certs: bool) -> reqwest::Client {
     reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_certs(accept_invalid_certs)
         .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
         .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+pub fn is_local_endpoint(endpoint: Option<&str>) -> bool {
+    if let Some(ep) = endpoint {
+        ep.contains("localhost") || ep.contains("127.0.0.1") || ep.contains("::1")
+    } else {
+        false
+    }
 }
 
 fn safe_truncate(text: &str, max_chars: usize) -> &str {
@@ -81,7 +89,7 @@ pub async fn get_embedding(
 ) -> Result<Vec<f32>, String> {
     use zeroize::Zeroizing;
 
-    let client = build_http_client();
+    let client = build_http_client(false);
     let url =
         "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:embedContent";
 
@@ -133,7 +141,7 @@ pub async fn get_embeddings_batch(
 
     use zeroize::Zeroizing;
 
-    let client = build_http_client();
+    let client = build_http_client(false);
     let url = "https://generativelanguage.googleapis.com/v1beta/models/text-embedding-004:batchEmbedContents";
 
     let decrypted_key = Zeroizing::new(api_key.decrypt());
@@ -201,7 +209,7 @@ pub async fn get_embedding_multiplexed(
         let endpoint_url = endpoint.unwrap_or("http://localhost:8000/v1/embeddings");
         let model_name = model.unwrap_or("nvidia/embeddings-nv-embed-qa-4");
 
-        let client = build_http_client();
+        let client = build_http_client(is_local_endpoint(endpoint));
         use zeroize::Zeroizing;
         let decrypted_key = Zeroizing::new(api_key.decrypt());
         let key_str = std::str::from_utf8(&decrypted_key)
@@ -265,7 +273,7 @@ pub async fn get_embeddings_batch_multiplexed(
         let endpoint_url = endpoint.unwrap_or("http://localhost:8000/v1/embeddings");
         let model_name = model.unwrap_or("nvidia/embeddings-nv-embed-qa-4");
 
-        let client = build_http_client();
+        let client = build_http_client(is_local_endpoint(endpoint));
         use zeroize::Zeroizing;
         let decrypted_key = Zeroizing::new(api_key.decrypt());
         let key_str = std::str::from_utf8(&decrypted_key)

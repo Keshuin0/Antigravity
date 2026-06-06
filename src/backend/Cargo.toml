@@ -13,7 +13,7 @@ tree-sitter-rust = "0.21.0"
 tree-sitter-typescript = "0.21.0"
 rusqlite = { version = "0.30", features = ["bundled"] } 
 sqlite-vec = "0.1.9"
-zerocopy = "0.4" # [cite: 166] 
+zerocopy = "0.8" # [cite: 166] 
 keyring = "2.0" # [cite: 97] 
 reqwest = { version = "0.12", features = ["stream", "json"] } # [cite: 108] 
 futures-util = "0.3"

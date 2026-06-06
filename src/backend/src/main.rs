@@ -688,12 +688,24 @@ async fn run_process_and_stream(
         }
     });
 
-    let status = child
-        .wait()
-        .await
-        .map_err(|e| format!("Process execution failed: {}", e))?;
-    let _ = stdout_handle.await;
-    let _ = stderr_handle.await;
+    let status_fut = async {
+        let status = child
+            .wait()
+            .await
+            .map_err(|e| format!("Process execution failed: {}", e))?;
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+        Ok::<_, String>(status)
+    };
+
+    let status = match tokio::time::timeout(std::time::Duration::from_secs(30), status_fut).await {
+        Ok(res) => res?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = tx.send("[Self-Healing Engine] Process execution timed out after 30 seconds. Process terminated.".to_string()).await;
+            return Err("Process execution timed out".to_string());
+        }
+    };
 
     let exit_code = status.code().unwrap_or(-1);
     let full_stderr = {
@@ -1188,18 +1200,58 @@ struct VfsEntry {
     is_dir: bool,
 }
 
+fn validate_path_in_workspace(path_str: &str, state: &AppState) -> Result<(), String> {
+    let workspace_root = state.workspace_root.lock().unwrap().clone();
+    
+    let root_path = Path::new(&workspace_root);
+    let target_path = Path::new(path_str);
+    
+    let canonical_root = crate::watcher::clean_unc_path(
+        &root_path.canonicalize().map_err(|e| format!("Failed to resolve workspace root: {}", e))?
+    );
+    
+    let canonical_target = if target_path.exists() {
+        crate::watcher::clean_unc_path(
+            &target_path.canonicalize().map_err(|e| format!("Failed to resolve path: {}", e))?
+        )
+    } else if let Some(parent) = target_path.parent() {
+        if parent.as_os_str().is_empty() {
+            return Err("Relative paths are not allowed outside workspace".to_string());
+        }
+        let canonical_parent = crate::watcher::clean_unc_path(
+            &parent.canonicalize().map_err(|e| format!("Failed to resolve parent directory: {}", e))?
+        );
+        if let Some(file_name) = target_path.file_name() {
+            canonical_parent.join(file_name)
+        } else {
+            canonical_parent
+        }
+    } else {
+        return Err("Invalid path structure".to_string());
+    };
+    
+    if canonical_target.starts_with(&canonical_root) {
+        Ok(())
+    } else {
+        Err("Access Denied: Path is outside of the active workspace".to_string())
+    }
+}
+
 #[tauri::command]
-fn read_workspace_file_cmd(path: String) -> Result<String, String> {
+fn read_workspace_file_cmd(path: String, state: State<'_, AppState>) -> Result<String, String> {
+    validate_path_in_workspace(&path, &state)?;
     std::fs::read_to_string(&path).map_err(|e| format!("Failed to read file: {}", e))
 }
 
 #[tauri::command]
-fn write_workspace_file_cmd(path: String, content: String) -> Result<(), String> {
+fn write_workspace_file_cmd(path: String, content: String, state: State<'_, AppState>) -> Result<(), String> {
+    validate_path_in_workspace(&path, &state)?;
     std::fs::write(&path, content).map_err(|e| format!("Failed to write file: {}", e))
 }
 
 #[tauri::command]
-fn read_workspace_dir_cmd(path: String) -> Result<Vec<VfsEntry>, String> {
+fn read_workspace_dir_cmd(path: String, state: State<'_, AppState>) -> Result<Vec<VfsEntry>, String> {
+    validate_path_in_workspace(&path, &state)?;
     let mut entries = Vec::new();
     let dir = std::path::Path::new(&path);
     if !dir.is_dir() {
@@ -1511,7 +1563,7 @@ async fn discover_models(
     api_key_str: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let client = crate::embeddings::build_http_client();
+    let client = crate::embeddings::build_http_client(crate::embeddings::is_local_endpoint(Some(&endpoint)));
 
     let key = if let Some(ref k) = api_key_str {
         if k.starts_with('•') || k.starts_with("•••") {
@@ -1734,7 +1786,7 @@ async fn upload_file_to_gemini(path: String, state: State<'_, AppState>) -> Resu
     let key_str =
         std::str::from_utf8(&decrypted_key).map_err(|e| format!("Invalid API key: {}", e))?;
 
-    let client = crate::embeddings::build_http_client();
+    let client = crate::embeddings::build_http_client(false);
     let url = format!(
         "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
         key_str

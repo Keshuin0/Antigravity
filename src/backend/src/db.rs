@@ -2,6 +2,7 @@ use rusqlite::{Connection, OptionalExtension, Result};
 use sha2::{Digest, Sha256};
 use sqlite_vec::sqlite3_vec_init;
 use std::path::{Path, PathBuf};
+use zerocopy::IntoBytes;
 
 #[allow(clippy::missing_transmute_annotations)]
 pub fn initialize_sqlite_extensions() {
@@ -91,7 +92,7 @@ pub struct SymbolToEmbed {
 
 pub fn f32_slice_to_u8_slice(slice: &[f32]) -> &[u8] {
     // Zero-Copy casting from f32 slice to u8 slice for binary BLOB binding
-    unsafe { std::slice::from_raw_parts(slice.as_ptr() as *const u8, std::mem::size_of_val(slice)) }
+    slice.as_bytes()
 }
 
 pub fn upsert_file_and_symbols(
@@ -101,6 +102,13 @@ pub fn upsert_file_and_symbols(
     last_modified: i64,
     symbols: &[crate::parser::ASTSymbol],
 ) -> Result<Vec<SymbolToEmbed>> {
+    // Clean UNC prefix if present
+    let file_path = if file_path.starts_with(r"\\?\") {
+        &file_path[4..]
+    } else {
+        file_path
+    };
+
     // 1. Calculate the file content hash
     let mut file_hasher = Sha256::new();
     file_hasher.update(content.as_bytes());
