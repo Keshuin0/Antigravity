@@ -3,6 +3,259 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "windows")]
+mod win_job {
+    use std::os::raw::c_void;
+
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
+        active_process_limit: u32,
+        minimum_working_set_size: usize,
+        maximum_working_set_size: usize,
+        active_process_limit_flags: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+
+    #[repr(C)]
+    #[allow(non_camel_case_types)]
+    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+        basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
+        io_info: [u8; 48],
+        process_memory_limit: usize,
+        job_memory_limit: usize,
+        peak_process_memory_limit: usize,
+        peak_job_memory_limit: usize,
+    }
+
+    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
+    const JOB_OBJECT_INFO_CLASS_EXTENDED_LIMIT_INFORMATION: i32 = 9;
+
+    extern "system" {
+        fn CreateJobObjectW(lpJobAttributes: *mut c_void, lpName: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(
+            hJob: *mut c_void,
+            JobObjectInformationClass: i32,
+            lpJobObjectInformation: *const c_void,
+            cbJobObjectInformationLength: u32,
+        ) -> i32;
+        fn AssignProcessToJobObject(hJob: *mut c_void, hProcess: *mut c_void) -> i32;
+        fn CloseHandle(hObject: *mut c_void) -> i32;
+    }
+
+    pub struct JobObject {
+        handle: *mut c_void,
+    }
+
+    unsafe impl Send for JobObject {}
+    unsafe impl Sync for JobObject {}
+
+    impl JobObject {
+        pub fn new() -> Result<Self, String> {
+            let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err("Failed to create Job Object".to_string());
+            }
+
+            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
+                basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION {
+                    active_process_limit: 0,
+                    minimum_working_set_size: 0,
+                    maximum_working_set_size: 0,
+                    active_process_limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                    affinity: 0,
+                    priority_class: 0,
+                    scheduling_class: 0,
+                },
+                io_info: [0u8; 48],
+                process_memory_limit: 0,
+                job_memory_limit: 0,
+                peak_process_memory_limit: 0,
+                peak_job_memory_limit: 0,
+            };
+
+            let success = unsafe {
+                SetInformationJobObject(
+                    handle,
+                    JOB_OBJECT_INFO_CLASS_EXTENDED_LIMIT_INFORMATION,
+                    &mut info as *mut _ as *const c_void,
+                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                )
+            };
+
+            if success == 0 {
+                unsafe { CloseHandle(handle) };
+                return Err("Failed to set Job Object limits".to_string());
+            }
+
+            Ok(JobObject { handle })
+        }
+
+        pub fn assign_process(&self, process_handle: *mut c_void) -> Result<(), String> {
+            let success = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
+            if success == 0 {
+                return Err("Failed to assign process to Job Object".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for JobObject {
+        fn drop(&mut self) {
+            unsafe {
+                CloseHandle(self.handle);
+            }
+        }
+    }
+}
+
+fn which_binary(name: &str) -> Option<PathBuf> {
+    if let Ok(path_env) = std::env::var("PATH") {
+        for path in std::env::split_paths(&path_env) {
+            let bin_path = path.join(name);
+            if bin_path.exists() {
+                return Some(bin_path);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_rust_analyzer_path() -> PathBuf {
+    if which_binary("rust-analyzer.exe").is_some() {
+        return PathBuf::from("rust-analyzer.exe");
+    }
+    let local_path = PathBuf::from(r"D:\Softwares\Installed\Rust\.cargo\bin\rust-analyzer.exe");
+    if local_path.exists() {
+        return local_path;
+    }
+    PathBuf::from("rust-analyzer")
+}
+
+fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    let bin_name = if cfg!(target_os = "windows") {
+        "typescript-language-server.cmd"
+    } else {
+        "typescript-language-server"
+    };
+    if which_binary(bin_name).is_some() {
+        return Ok(PathBuf::from(bin_name));
+    }
+
+    let local_servers_dir = PathBuf::from(r"D:\Softwares\Installed\Antigravity\lsp-servers\ts-lsp");
+    let local_bin_path = if cfg!(target_os = "windows") {
+        local_servers_dir.join(r"node_modules\.bin\typescript-language-server.cmd")
+    } else {
+        local_servers_dir.join("node_modules/.bin/typescript-language-server")
+    };
+
+    if local_bin_path.exists() {
+        return Ok(local_bin_path);
+    }
+
+    // Auto-install TS Server locally
+    {
+        let state = app_handle.state::<crate::AppState>();
+        let mut logs = state.logs.lock().unwrap();
+        logs.push("LSP [typescript]: typescript-language-server not found in PATH. Initiating automatic local installation...".to_string());
+    }
+
+    let _ = std::fs::create_dir_all(&local_servers_dir);
+    let npm_bin = if cfg!(target_os = "windows") {
+        let local_npm = PathBuf::from(r"D:\Softwares\Installed\NodeJS\npm.cmd");
+        if local_npm.exists() {
+            local_npm
+        } else {
+            PathBuf::from("npm.cmd")
+        }
+    } else {
+        PathBuf::from("npm")
+    };
+
+    let mut child = std::process::Command::new(&npm_bin)
+        .args(&[
+            "install",
+            "--prefix",
+            &local_servers_dir.to_string_lossy(),
+            "typescript-language-server",
+            "typescript",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Failed to spawn npm installer: {}", e))?;
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for npm installer: {}", e))?;
+
+    if status.success() && local_bin_path.exists() {
+        let state = app_handle.state::<crate::AppState>();
+        let mut logs = state.logs.lock().unwrap();
+        logs.push("LSP [typescript]: Automatic local installation completed successfully.".to_string());
+        Ok(local_bin_path)
+    } else {
+        Err(format!(
+            "Failed to auto-install typescript-language-server. Exit code: {:?}",
+            status.code()
+        ))
+    }
+}
+
+fn apply_incremental_edit(content: &mut String, range_val: &Value, new_text: &str) -> Result<(), String> {
+    let start_line = range_val.get("start").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range start line")? as usize;
+    let start_char = range_val.get("start").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range start character")? as usize;
+    let end_line = range_val.get("end").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range end line")? as usize;
+    let end_char = range_val.get("end").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range end character")? as usize;
+
+    let lines: Vec<&str> = content.split('\n').collect();
+
+    if start_line >= lines.len() || end_line >= lines.len() {
+        return Err("Edit coordinates out of bounds".to_string());
+    }
+
+    let start_byte = utf16_char_to_utf8_byte_offset(lines[start_line], start_char)?;
+    let end_byte = utf16_char_to_utf8_byte_offset(lines[end_line], end_char)?;
+
+    let mut new_content = String::new();
+    for i in 0..start_line {
+        new_content.push_str(lines[i]);
+        new_content.push('\n');
+    }
+
+    let start_line_str = lines[start_line];
+    new_content.push_str(&start_line_str[..start_byte]);
+    new_content.push_str(new_text);
+
+    let end_line_str = lines[end_line];
+    new_content.push_str(&end_line_str[end_byte..]);
+
+    for i in (end_line + 1)..lines.len() {
+        new_content.push('\n');
+        new_content.push_str(lines[i]);
+    }
+
+    *content = new_content;
+    Ok(())
+}
+
+fn utf16_char_to_utf8_byte_offset(line: &str, utf16_char_offset: usize) -> Result<usize, String> {
+    let mut utf16_count = 0;
+    let mut byte_count = 0;
+
+    for c in line.chars() {
+        if utf16_count >= utf16_char_offset {
+            break;
+        }
+        utf16_count += c.len_utf16();
+        byte_count += c.len_utf8();
+    }
+
+    Ok(byte_count)
+}
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -20,6 +273,8 @@ pub struct LspClient {
     pending_requests: Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>,
     open_files: Arc<Mutex<HashMap<String, String>>>,
     shutdown_tx: mpsc::Sender<()>,
+    #[cfg(target_os = "windows")]
+    _job_object: Option<win_job::JobObject>,
 }
 
 impl LspClient {
@@ -33,31 +288,22 @@ impl LspClient {
             .canonicalize()
             .unwrap_or_else(|_| root_path_buf.clone());
 
-        // 1. Resolve language server binaries and arguments
+        // 1. Resolve language server binaries and arguments dynamically
         let (program, args) = match language.to_lowercase().as_str() {
             "rust" => {
-                let bin = if cfg!(target_os = "windows") {
-                    "rust-analyzer.exe"
-                } else {
-                    "rust-analyzer"
-                };
-                (bin.to_string(), vec![])
+                let bin_path = resolve_rust_analyzer_path();
+                (bin_path.to_string_lossy().to_string(), vec![])
             }
             "typescript" | "javascript" => {
-                if cfg!(target_os = "windows") {
+                let bin_path = resolve_typescript_server_path(&app_handle)?;
+                let bin_str = bin_path.to_string_lossy().to_string();
+                if bin_str.ends_with(".cmd") {
                     (
                         "cmd.exe".to_string(),
-                        vec![
-                            "/C".to_string(),
-                            "typescript-language-server.cmd".to_string(),
-                            "--stdio".to_string(),
-                        ],
+                        vec!["/C".to_string(), bin_str, "--stdio".to_string()],
                     )
                 } else {
-                    (
-                        "typescript-language-server".to_string(),
-                        vec!["--stdio".to_string()],
-                    )
+                    (bin_str, vec!["--stdio".to_string()])
                 }
             }
             _ => return Err(format!("Unsupported language server: {}", language)),
@@ -84,6 +330,23 @@ impl LspClient {
             .spawn()
             .map_err(|e| format!("Failed to spawn language server process: {}", e))?;
 
+        #[cfg(target_os = "windows")]
+        let job_object = match win_job::JobObject::new() {
+            Ok(job) => {
+                use std::os::windows::io::AsRawHandle;
+                if let Some(raw_handle) = child.raw_handle() {
+                    let _ = job.assign_process(raw_handle as *mut std::os::raw::c_void);
+                }
+                Some(job)
+            }
+            Err(e) => {
+                let state = app_handle.state::<crate::AppState>();
+                let mut logs = state.logs.lock().unwrap();
+                logs.push(format!("LSP warning: failed to create process sandbox: {}", e));
+                None
+            }
+        };
+
         let stdin = child.stdin.take().ok_or("Failed to open child stdin")?;
         let stdout = child.stdout.take().ok_or("Failed to open child stdout")?;
         let stderr = child.stderr.take().ok_or("Failed to open child stderr")?;
@@ -99,6 +362,8 @@ impl LspClient {
             pending_requests: pending_requests.clone(),
             open_files: open_files.clone(),
             shutdown_tx,
+            #[cfg(target_os = "windows")]
+            _job_object: job_object,
         });
 
         // 2. Spawn Stderr Logger Task
@@ -272,7 +537,7 @@ impl LspClient {
                 {
                     let mut state_clients = state.lsp_clients.lock().unwrap();
                     if let Some(map) = state_clients.as_mut() {
-                        map.remove(&lang_name_mon);
+                        map.remove(&(root_path_mon.clone(), lang_name_mon.clone()));
                     }
                 }
 
@@ -283,7 +548,7 @@ impl LspClient {
                         {
                             let mut state_clients = state.lsp_clients.lock().unwrap();
                             if let Some(map) = state_clients.as_mut() {
-                                map.insert(lang_name_mon.clone(), new_client.clone());
+                                map.insert((root_path_mon.clone(), lang_name_mon.clone()), new_client.clone());
                             }
                         }
 
@@ -389,6 +654,24 @@ impl LspClient {
                     },
                     "definition": {
                         "dynamicRegistration": true
+                    },
+                    "formatting": {
+                        "dynamicRegistration": true
+                    },
+                    "references": {
+                        "dynamicRegistration": true
+                    },
+                    "rename": {
+                        "dynamicRegistration": true,
+                        "prepareSupport": true
+                    },
+                    "codeAction": {
+                        "dynamicRegistration": true,
+                        "codeActionLiteralSupport": {
+                            "codeActionKind": {
+                                "valueSet": ["quickfix", "refactor"]
+                            }
+                        }
                     }
                 }
             }
@@ -455,14 +738,16 @@ impl LspClient {
         {
             let mut files = self.open_files.lock().unwrap();
             if let Some(content) = files.get_mut(path) {
-                if range.is_none() {
+                if let Some(ref r) = range {
+                    if let Err(e) = apply_incremental_edit(content, r, text) {
+                        let _ = self.send_notification("telemetry/event", json!({
+                            "type": "error",
+                            "message": format!("LSP Incremental patch failed: {}", e)
+                        }));
+                    }
+                } else {
                     // Full sync update
                     *content = text.to_string();
-                } else {
-                    // Quick fallback: for incremental change, we could compute the delta,
-                    // but since the file is edited locally, we can let open_files update on save
-                    // or let didChange do full update when None is passed.
-                    // For safety, if it is incremental edit, we will also sync file state on save.
                 }
             }
         }
@@ -503,3 +788,34 @@ impl LspClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_incremental_delta_patcher() {
+        let mut content = "line one\nline two\nline three".to_string();
+        let range = serde_json::json!({
+            "start": { "line": 1, "character": 5 },
+            "end": { "line": 1, "character": 8 }
+        });
+        apply_incremental_edit(&mut content, &range, "new").unwrap();
+        assert_eq!(content, "line one\nline new\nline three");
+    }
+
+    #[test]
+    fn test_utf16_to_utf8_offset() {
+        let emoji_line = "hello 👋 world";
+        // 👋 is a 4-byte UTF-8 character, but 2-unit UTF-16 surrogate pair
+        // "h", "e", "l", "l", "o", " " (6 chars)
+        // 👋 start index: 6 in UTF-16, 6 in UTF-8
+        let byte_offset_start = utf16_char_to_utf8_byte_offset(emoji_line, 6).unwrap();
+        assert_eq!(byte_offset_start, 6);
+
+        // 👋 end index: 8 in UTF-16, 10 in UTF-8 (since 👋 is 4 bytes)
+        let byte_offset_end = utf16_char_to_utf8_byte_offset(emoji_line, 8).unwrap();
+        assert_eq!(byte_offset_end, 10);
+    }
+}
+
