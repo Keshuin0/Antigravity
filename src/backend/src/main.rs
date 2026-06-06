@@ -741,6 +741,7 @@ fn rollback_and_cleanup_git(workspace: &str, original_branch: Option<&str>, temp
 
 async fn self_healing_loop(
     command: String,
+    attachments: Option<Vec<crate::inference::Attachment>>,
     channel: tauri::ipc::Channel<String>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -1018,6 +1019,7 @@ async fn self_healing_loop(
         let endpoint_clone = endpoint.clone();
         let model_clone = model.clone();
         let app_handle_clone = app_handle.clone();
+        let attachments_clone = attachments.clone();
 
         tokio::spawn(async move {
             let _ =
@@ -1027,6 +1029,7 @@ async fn self_healing_loop(
                     model_clone.as_deref(),
                     &api_key_clone,
                     &prompt,
+                    attachments_clone,
                     api_tx,
                     Some(app_handle_clone),
                 ).await;
@@ -1070,11 +1073,12 @@ async fn self_healing_loop(
 #[tauri::command]
 async fn execute_command_stream(
     command: String,
+    attachments: Option<Vec<crate::inference::Attachment>>,
     channel: tauri::ipc::Channel<String>,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    self_healing_loop(command, channel, state, app_handle).await
+    self_healing_loop(command, attachments, channel, state, app_handle).await
 }
 
 #[tauri::command]
@@ -1418,6 +1422,7 @@ async fn test_llm_connection(
             model_name.as_deref(),
             &api_key,
             prompt,
+            None,
             tx,
             None,
         ).await
@@ -1532,6 +1537,209 @@ async fn discover_models(
     Ok(models)
 }
 
+fn sniff_mime_type_helper(bytes: &[u8], extension: &str) -> String {
+    if bytes.starts_with(&[137, 80, 78, 71, 13, 10, 26, 10]) {
+        "image/png".to_string()
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg".to_string()
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp".to_string()
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "image/gif".to_string()
+    } else if bytes.starts_with(b"%PDF-") {
+        "application/pdf".to_string()
+    } else {
+        match extension.to_lowercase().as_str() {
+            "png" => "image/png".to_string(),
+            "jpg" | "jpeg" => "image/jpeg".to_string(),
+            "webp" => "image/webp".to_string(),
+            "gif" => "image/gif".to_string(),
+            "pdf" => "application/pdf".to_string(),
+            "txt" | "log" | "rs" | "ts" | "tsx" | "js" | "jsx" | "json" | "csv" | "md" | "toml" | "yaml" | "yml" | "css" | "html" => {
+                "text/plain".to_string()
+            }
+            _ => {
+                if std::str::from_utf8(bytes).is_ok() {
+                    "text/plain".to_string()
+                } else {
+                    "application/octet-stream".to_string()
+                }
+            }
+        }
+    }
+}
+
+#[tauri::command]
+async fn open_file_dialog() -> Result<Option<String>, String> {
+    let file = rfd::AsyncFileDialog::new()
+        .set_title("Select File to Attach")
+        .pick_file()
+        .await;
+    Ok(file.map(|f| f.path().to_string_lossy().to_string()))
+}
+
+#[derive(serde::Serialize)]
+struct FileSniffResult {
+    mime_type: String,
+    size: u64,
+}
+
+#[tauri::command]
+fn sniff_file_type(path: String) -> Result<FileSniffResult, String> {
+    let file_path = Path::new(&path);
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {}", path));
+    }
+    let metadata = std::fs::metadata(file_path).map_err(|e| format!("Failed to read metadata: {}", e))?;
+    let bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mime_type = sniff_mime_type_helper(&bytes, extension);
+    Ok(FileSniffResult {
+        mime_type,
+        size: metadata.len(),
+    })
+}
+
+#[tauri::command]
+fn extract_document_text(path: String) -> Result<String, String> {
+    let file_path = Path::new(&path);
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {}", path));
+    }
+    let bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    let mime_type = sniff_mime_type_helper(&bytes, extension);
+    if mime_type == "application/pdf" {
+        pdf_extract::extract_text(&path)
+            .map_err(|e| format!("Failed to extract PDF text: {}", e))
+    } else {
+        match String::from_utf8(bytes) {
+            Ok(text) => Ok(text),
+            Err(_) => Err("File is binary and cannot be read as text".to_string()),
+        }
+    }
+}
+
+#[tauri::command]
+async fn upload_file_to_gemini(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let file_path = Path::new(&path);
+    if !file_path.exists() {
+        return Err(format!("File does not exist: {}", path));
+    }
+    
+    let file_bytes = std::fs::read(file_path).map_err(|e| format!("Failed to read file: {}", e))?;
+    let display_name = file_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+        
+    let extension = file_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+        
+    let mime_type = sniff_mime_type_helper(&file_bytes, extension);
+    
+    // Obtain API key
+    let provider = state.llm_provider.lock().unwrap().clone();
+    let api_key_obf = {
+        let key = state.api_token.lock().unwrap();
+        key.clone()
+    };
+    
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                obf
+            } else {
+                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    crate::security::ObfBox::new(env_key.as_bytes())
+                } else {
+                    return Err(format!("API Key is not configured for provider '{}'.", provider));
+                }
+            }
+        }
+    };
+    
+    use zeroize::Zeroizing;
+    let decrypted_key = Zeroizing::new(final_api_key.decrypt());
+    let key_str = std::str::from_utf8(&decrypted_key)
+        .map_err(|e| format!("Invalid API key: {}", e))?;
+        
+    let client = crate::embeddings::build_http_client();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/upload/v1beta/files?key={}",
+        key_str
+    );
+    
+    let boundary = "antigravity_multipart_boundary_12345";
+    let mut body = Vec::new();
+    
+    // Part 1: Metadata
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(b"Content-Type: application/json; charset=UTF-8\r\n\r\n");
+    let metadata = serde_json::json!({
+        "file": {
+            "displayName": display_name
+        }
+    });
+    body.extend_from_slice(metadata.to_string().as_bytes());
+    body.extend_from_slice(b"\r\n");
+    
+    // Part 2: Data
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(format!("Content-Type: {}\r\n\r\n", mime_type).as_bytes());
+    body.extend_from_slice(&file_bytes);
+    body.extend_from_slice(b"\r\n");
+    
+    // End
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+    
+    let response = client
+        .post(&url)
+        .header("Content-Type", format!("multipart/related; boundary={}", boundary))
+        .body(body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send upload request: {}", e))?;
+        
+    let status = response.status();
+    if !status.is_success() {
+        let err_text = response.text().await.unwrap_or_default();
+        return Err(format!("Gemini Files API upload failed ({}): {}", status, err_text));
+    }
+    
+    #[derive(serde::Deserialize)]
+    struct FileInfo {
+        uri: String,
+    }
+    
+    #[derive(serde::Deserialize)]
+    struct GeminiUploadResponse {
+        file: FileInfo,
+    }
+    
+    let result: GeminiUploadResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse upload response JSON: {}", e))?;
+        
+    Ok(result.file.uri)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -1641,7 +1849,11 @@ fn main() {
             lsp_send_request,
             lsp_shutdown,
             test_llm_connection,
-            discover_models
+            discover_models,
+            sniff_file_type,
+            extract_document_text,
+            upload_file_to_gemini,
+            open_file_dialog
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
