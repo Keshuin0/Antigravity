@@ -1,12 +1,95 @@
 import React, { useEffect, useRef } from 'react';
 import Editor, { Monaco } from '@monaco-editor/react';
+import { invoke } from '@tauri-apps/api/core';
+import type { editor } from 'monaco-editor';
+
+interface LspPosition {
+  line: number;
+  character: number;
+}
+
+interface LspRange {
+  start: LspPosition;
+  end: LspPosition;
+}
+
+interface LspDiagnostic {
+  range: LspRange;
+  severity?: number;
+  code?: string | number;
+  source?: string;
+  message: string;
+  tags?: number[];
+  relatedInformation?: unknown[];
+}
+
+interface LspCompletionItem {
+  label: string;
+  kind?: number;
+  detail?: string;
+  documentation?: string | { value: string };
+  insertText?: string;
+  insertTextFormat?: number;
+  textEdit?: {
+    range: LspRange;
+    newText: string;
+  };
+}
+
+interface LspCompletionList {
+  isIncomplete: boolean;
+  items: LspCompletionItem[];
+}
+
+type LspCompletionResponse = LspCompletionItem[] | LspCompletionList;
+
+interface LspMarkedString {
+  language: string;
+  value: string;
+}
+
+interface LspMarkupContent {
+  kind: 'markdown' | 'plaintext';
+  value: string;
+}
+
+type LspHoverContent = string | LspMarkedString | LspMarkupContent;
+
+interface LspHover {
+  contents: LspHoverContent | LspHoverContent[];
+  range?: LspRange;
+}
+
+interface LspLocation {
+  uri: string;
+  range: LspRange;
+}
+
+interface LspLocationLink {
+  originSelectionRange?: LspRange;
+  targetUri: string;
+  targetRange: LspRange;
+  targetSelectionRange: LspRange;
+}
+
+type LspDefinitionResponse = LspLocation | LspLocation[] | LspLocationLink[];
+
+interface LspLocationInfo {
+  uri?: string;
+  targetUri?: string;
+  range?: LspRange;
+  targetSelectionRange?: LspRange;
+}
 
 interface MonacoEditorProps {
   filePath: string;
   content: string;
   onContentChange: (newContent: string) => void;
   onSave: () => void;
+  diagnostics: Record<string, LspDiagnostic[]>;
 }
+
+const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 const getLanguageFromExtension = (path: string): string => {
   const ext = path.split('.').pop()?.toLowerCase();
@@ -16,7 +99,7 @@ const getLanguageFromExtension = (path: string): string => {
     case 'ts':
       return 'typescript';
     case 'tsx':
-      return 'typescript'; // Monaco handles typescript language service for both ts and tsx
+      return 'typescript';
     case 'js':
       return 'javascript';
     case 'jsx':
@@ -49,33 +132,49 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
   content,
   onContentChange,
   onSave,
+  diagnostics,
 }) => {
   const editorRef = useRef<StandaloneCodeEditor | null>(null);
+  const monacoRef = useRef<Monaco | null>(null);
+  const disposablesRef = useRef<{ dispose: () => void }[]>([]);
+
+  // Cleanup Monaco LSP Providers on Unmount
+  const clearLspProviders = () => {
+    disposablesRef.current.forEach((d) => d.dispose());
+    disposablesRef.current = [];
+  };
+
+  useEffect(() => {
+    return () => {
+      clearLspProviders();
+    };
+  }, []);
 
   const handleEditorDidMount = (editor: StandaloneCodeEditor, monaco: Monaco) => {
     editorRef.current = editor;
+    monacoRef.current = monaco;
 
-    // Define a custom, high-fidelity dark telemetry theme
+    // Define custom telemetry theme
     monaco.editor.defineTheme('antigravity-telemetry', {
       base: 'vs-dark',
       inherit: true,
       rules: [
         { token: '', foreground: 'E2E8F0', background: '0D1117' },
         { token: 'comment', foreground: '64748B', fontStyle: 'italic' },
-        { token: 'keyword', foreground: 'FF79C6', fontStyle: 'bold' }, // Pink
-        { token: 'string', foreground: '50FA7B' }, // Green
-        { token: 'number', foreground: 'BD93F9' }, // Purple
-        { token: 'regexp', foreground: 'F1FA8C' }, // Yellow
-        { token: 'type', foreground: '8BE9FD', fontStyle: 'italic' }, // Cyan
+        { token: 'keyword', foreground: 'FF79C6', fontStyle: 'bold' },
+        { token: 'string', foreground: '50FA7B' },
+        { token: 'number', foreground: 'BD93F9' },
+        { token: 'regexp', foreground: 'F1FA8C' },
+        { token: 'type', foreground: '8BE9FD', fontStyle: 'italic' },
         { token: 'class', foreground: '8BE9FD' },
         { token: 'function', foreground: '50FA7B' },
         { token: 'variable', foreground: 'F8F8F2' },
       ],
       colors: {
-        'editor.background': '#090d13', // Ultra-dark grey
+        'editor.background': '#090d13',
         'editor.foreground': '#E2E8F0',
-        'editor.lineHighlightBackground': '#1E293B33', // Subtle highlight
-        'editorCursor.foreground': '#22D3EE', // Cyan caret
+        'editor.lineHighlightBackground': '#1E293B33',
+        'editorCursor.foreground': '#22D3EE',
         'editor.selectionBackground': '#33415566',
         'editorLineNumber.foreground': '#475569',
         'editorLineNumber.activeForeground': '#22D3EE',
@@ -87,10 +186,214 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
 
     monaco.editor.setTheme('antigravity-telemetry');
 
-    // Register a custom command/action for Ctrl+S
+    // Register Ctrl+S FFI Save
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => {
       onSave();
     });
+
+    // Register Pinnacle LSP Monaco Providers
+    if (isTauri) {
+      clearLspProviders();
+
+      const languagesToRegister = ['rust', 'typescript', 'javascript'];
+
+      languagesToRegister.forEach((lang) => {
+        // 1. Completion Provider
+        const completionDisposable = monaco.languages.registerCompletionItemProvider(lang, {
+          triggerCharacters: ['.', ':', '::', '(', ','],
+          provideCompletionItems: async (model, position) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspCompletionResponse>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/completion',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                },
+              });
+
+              if (!response) return { suggestions: [] };
+
+              const items = Array.isArray(response) ? response : response.items || [];
+              const suggestions = items.map((item: LspCompletionItem) => {
+                let kind = monaco.languages.CompletionItemKind.Variable;
+                if (item.kind) {
+                  const lspToMonacoKind: Record<number, number> = {
+                    1: monaco.languages.CompletionItemKind.Text,
+                    2: monaco.languages.CompletionItemKind.Method,
+                    3: monaco.languages.CompletionItemKind.Function,
+                    4: monaco.languages.CompletionItemKind.Constructor,
+                    5: monaco.languages.CompletionItemKind.Field,
+                    6: monaco.languages.CompletionItemKind.Variable,
+                    7: monaco.languages.CompletionItemKind.Class,
+                    8: monaco.languages.CompletionItemKind.Interface,
+                    9: monaco.languages.CompletionItemKind.Module,
+                    10: monaco.languages.CompletionItemKind.Property,
+                    11: monaco.languages.CompletionItemKind.Unit,
+                    12: monaco.languages.CompletionItemKind.Value,
+                    13: monaco.languages.CompletionItemKind.Enum,
+                    14: monaco.languages.CompletionItemKind.Keyword,
+                    15: monaco.languages.CompletionItemKind.Snippet,
+                    16: monaco.languages.CompletionItemKind.Color,
+                    17: monaco.languages.CompletionItemKind.File,
+                    18: monaco.languages.CompletionItemKind.Reference,
+                    19: monaco.languages.CompletionItemKind.Folder,
+                    20: monaco.languages.CompletionItemKind.EnumMember,
+                    21: monaco.languages.CompletionItemKind.Constant,
+                    22: monaco.languages.CompletionItemKind.Struct,
+                    23: monaco.languages.CompletionItemKind.Event,
+                    24: monaco.languages.CompletionItemKind.Operator,
+                    25: monaco.languages.CompletionItemKind.TypeParameter,
+                  };
+                  kind = lspToMonacoKind[item.kind] || monaco.languages.CompletionItemKind.Variable;
+                }
+
+                const range = item.textEdit
+                  ? {
+                      startLineNumber: item.textEdit.range.start.line + 1,
+                      startColumn: item.textEdit.range.start.character + 1,
+                      endLineNumber: item.textEdit.range.end.line + 1,
+                      endColumn: item.textEdit.range.end.character + 1,
+                    }
+                  : {
+                      startLineNumber: position.lineNumber,
+                      startColumn: position.column,
+                      endLineNumber: position.lineNumber,
+                      endColumn: position.column,
+                    };
+
+                const suggestion: import('monaco-editor').languages.CompletionItem = {
+                  label: item.label,
+                  kind,
+                  insertText: item.insertText || item.textEdit?.newText || item.label,
+                  range,
+                };
+
+                if (item.detail !== undefined) {
+                  suggestion.detail = item.detail;
+                }
+
+                if (item.documentation !== undefined) {
+                  const doc = typeof item.documentation === 'string'
+                    ? item.documentation
+                    : item.documentation?.value;
+                  if (doc !== undefined) {
+                    suggestion.documentation = doc;
+                  }
+                }
+
+                if (item.insertTextFormat === 2) {
+                  suggestion.insertTextRules = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+                }
+
+                return suggestion;
+              });
+
+              return { suggestions };
+            } catch (e) {
+              console.warn(`LSP Completion failed for ${lang}:`, e);
+              return { suggestions: [] };
+            }
+          },
+        });
+        disposablesRef.current.push(completionDisposable);
+
+        // 2. Hover Provider
+        const hoverDisposable = monaco.languages.registerHoverProvider(lang, {
+          provideHover: async (model, position) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspHover | null>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/hover',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                },
+              });
+
+              if (!response || !response.contents) return null;
+
+              let value = '';
+              if (typeof response.contents === 'string') {
+                value = response.contents;
+              } else if (Array.isArray(response.contents)) {
+                value = response.contents
+                  .map((c: LspHoverContent) => (typeof c === 'string' ? c : c.value))
+                  .join('\n\n');
+              } else if (response.contents && 'value' in response.contents) {
+                value = response.contents.value;
+              }
+
+              const hoverResult: {
+                contents: { value: string }[];
+                range?: {
+                  startLineNumber: number;
+                  startColumn: number;
+                  endLineNumber: number;
+                  endColumn: number;
+                };
+              } = {
+                contents: [{ value }],
+              };
+              if (response.range) {
+                hoverResult.range = {
+                  startLineNumber: response.range.start.line + 1,
+                  startColumn: response.range.start.character + 1,
+                  endLineNumber: response.range.end.line + 1,
+                  endColumn: response.range.end.character + 1,
+                };
+              }
+              return hoverResult;
+            } catch (e) {
+              console.warn(`LSP Hover failed for ${lang}:`, e);
+              return null;
+            }
+          },
+        });
+        disposablesRef.current.push(hoverDisposable);
+
+        // 3. Definition Provider
+        const definitionDisposable = monaco.languages.registerDefinitionProvider(lang, {
+          provideDefinition: async (model, position) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspDefinitionResponse | null>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/definition',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                },
+              });
+
+              if (!response) return null;
+
+              const locations = Array.isArray(response) ? response : [response];
+              return locations.map((loc: LspLocationInfo) => {
+                const targetUri = loc.uri || loc.targetUri || '';
+                const range = loc.range || loc.targetSelectionRange;
+                if (!range) return null;
+                return {
+                  uri: monaco.Uri.parse(targetUri),
+                  range: {
+                    startLineNumber: range.start.line + 1,
+                    startColumn: range.start.character + 1,
+                    endLineNumber: range.end.line + 1,
+                    endColumn: range.end.character + 1,
+                  },
+                };
+              }).filter(Boolean) as import('monaco-editor').languages.Location[];
+            } catch (e) {
+              console.warn(`LSP Definition failed for ${lang}:`, e);
+              return null;
+            }
+          },
+        });
+        disposablesRef.current.push(definitionDisposable);
+      });
+    }
   };
 
   // Focus editor when file changes
@@ -99,6 +402,66 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
       editorRef.current.focus();
     }
   }, [filePath]);
+
+  // Apply Diagnostic Markers (squiggles)
+  useEffect(() => {
+    if (!editorRef.current || !monacoRef.current || !isTauri) return;
+
+    const model = editorRef.current.getModel();
+    if (!model) return;
+
+    const uri = model.uri.toString();
+    const fileDiags = diagnostics[uri] || [];
+
+    const markers = fileDiags.map((diag: LspDiagnostic) => {
+      let severity = monacoRef.current!.MarkerSeverity.Info;
+      if (diag.severity === 1) severity = monacoRef.current!.MarkerSeverity.Error;
+      else if (diag.severity === 2) severity = monacoRef.current!.MarkerSeverity.Warning;
+      else if (diag.severity === 3) severity = monacoRef.current!.MarkerSeverity.Info;
+      else if (diag.severity === 4) severity = monacoRef.current!.MarkerSeverity.Hint;
+
+      return {
+        message: diag.message,
+        severity,
+        startLineNumber: diag.range.start.line + 1,
+        startColumn: diag.range.start.character + 1,
+        endLineNumber: diag.range.end.line + 1,
+        endColumn: diag.range.end.character + 1,
+        source: diag.source || 'LSP',
+      };
+    });
+
+    monacoRef.current.editor.setModelMarkers(model, 'lsp', markers);
+  }, [diagnostics, filePath]);
+
+  const handleChange = (val: string | undefined, ev: editor.IModelContentChangedEvent) => {
+    onContentChange(val || '');
+
+    if (!isTauri || !ev || !ev.changes) return;
+
+    const ext = filePath.split('.').pop()?.toLowerCase();
+    const lang =
+      ext === 'rs'
+        ? 'rust'
+        : ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx'
+          ? 'typescript'
+          : null;
+
+    if (lang) {
+      for (const change of ev.changes) {
+        const lspRange = {
+          start: { line: change.range.startLineNumber - 1, character: change.range.startColumn - 1 },
+          end: { line: change.range.endLineNumber - 1, character: change.range.endColumn - 1 },
+        };
+        invoke('lsp_file_change', {
+          language: lang,
+          path: filePath,
+          range: lspRange,
+          text: change.text,
+        }).catch((err) => console.warn('LSP file change failed:', err));
+      }
+    }
+  };
 
   const language = getLanguageFromExtension(filePath);
 
@@ -118,7 +481,7 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
           height="100%"
           language={language}
           value={content}
-          onChange={(val) => onContentChange(val || '')}
+          onChange={handleChange}
           onMount={handleEditorDidMount}
           options={{
             fontSize: 14,

@@ -16,6 +16,7 @@ sqlite-vec = "0.1.9"
 zerocopy = "0.4" # [cite: 166] 
 keyring = "2.0" # [cite: 97] 
 reqwest = { version = "0.12", features = ["stream", "json"] } # [cite: 108] 
+futures-util = "0.3"
 git2 = "0.21.0" # [cite: 195] 
 sha2 = "0.10"
 hex = "0.4" 
