@@ -103,8 +103,8 @@ pub fn upsert_file_and_symbols(
     symbols: &[crate::parser::ASTSymbol],
 ) -> Result<Vec<SymbolToEmbed>> {
     // Clean UNC prefix if present
-    let file_path = if file_path.starts_with(r"\\?\") {
-        &file_path[4..]
+    let file_path = if let Some(stripped) = file_path.strip_prefix(r"\\?\") {
+        stripped
     } else {
         file_path
     };

@@ -336,8 +336,8 @@ async fn handle_debounced_changes(
             let mut db_lock = db_conn.lock().unwrap();
             if let Some(conn) = db_lock.as_mut() {
                 let raw_path_str = path.to_string_lossy().to_string();
-                let path_str = if raw_path_str.starts_with(r"\\?\") {
-                    raw_path_str[4..].to_string()
+                let path_str = if let Some(stripped) = raw_path_str.strip_prefix(r"\\?\") {
+                    stripped.to_string()
                 } else {
                     raw_path_str
                 };

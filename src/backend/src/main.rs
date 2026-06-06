@@ -1202,24 +1202,30 @@ struct VfsEntry {
 
 fn validate_path_in_workspace(path_str: &str, state: &AppState) -> Result<(), String> {
     let workspace_root = state.workspace_root.lock().unwrap().clone();
-    
+
     let root_path = Path::new(&workspace_root);
     let target_path = Path::new(path_str);
-    
+
     let canonical_root = crate::watcher::clean_unc_path(
-        &root_path.canonicalize().map_err(|e| format!("Failed to resolve workspace root: {}", e))?
+        &root_path
+            .canonicalize()
+            .map_err(|e| format!("Failed to resolve workspace root: {}", e))?,
     );
-    
+
     let canonical_target = if target_path.exists() {
         crate::watcher::clean_unc_path(
-            &target_path.canonicalize().map_err(|e| format!("Failed to resolve path: {}", e))?
+            &target_path
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve path: {}", e))?,
         )
     } else if let Some(parent) = target_path.parent() {
         if parent.as_os_str().is_empty() {
             return Err("Relative paths are not allowed outside workspace".to_string());
         }
         let canonical_parent = crate::watcher::clean_unc_path(
-            &parent.canonicalize().map_err(|e| format!("Failed to resolve parent directory: {}", e))?
+            &parent
+                .canonicalize()
+                .map_err(|e| format!("Failed to resolve parent directory: {}", e))?,
         );
         if let Some(file_name) = target_path.file_name() {
             canonical_parent.join(file_name)
@@ -1229,7 +1235,7 @@ fn validate_path_in_workspace(path_str: &str, state: &AppState) -> Result<(), St
     } else {
         return Err("Invalid path structure".to_string());
     };
-    
+
     if canonical_target.starts_with(&canonical_root) {
         Ok(())
     } else {
@@ -1244,13 +1250,20 @@ fn read_workspace_file_cmd(path: String, state: State<'_, AppState>) -> Result<S
 }
 
 #[tauri::command]
-fn write_workspace_file_cmd(path: String, content: String, state: State<'_, AppState>) -> Result<(), String> {
+fn write_workspace_file_cmd(
+    path: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     validate_path_in_workspace(&path, &state)?;
     std::fs::write(&path, content).map_err(|e| format!("Failed to write file: {}", e))
 }
 
 #[tauri::command]
-fn read_workspace_dir_cmd(path: String, state: State<'_, AppState>) -> Result<Vec<VfsEntry>, String> {
+fn read_workspace_dir_cmd(
+    path: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<VfsEntry>, String> {
     validate_path_in_workspace(&path, &state)?;
     let mut entries = Vec::new();
     let dir = std::path::Path::new(&path);
@@ -1563,7 +1576,8 @@ async fn discover_models(
     api_key_str: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<String>, String> {
-    let client = crate::embeddings::build_http_client(crate::embeddings::is_local_endpoint(Some(&endpoint)));
+    let client =
+        crate::embeddings::build_http_client(crate::embeddings::is_local_endpoint(Some(&endpoint)));
 
     let key = if let Some(ref k) = api_key_str {
         if k.starts_with('•') || k.starts_with("•••") {
