@@ -81,6 +81,42 @@ interface LspLocationInfo {
   targetSelectionRange?: LspRange;
 }
 
+interface LspTextEdit {
+  range: LspRange;
+  newText: string;
+}
+
+interface LspTextDocumentIdentifier {
+  uri: string;
+}
+
+interface LspTextDocumentEdit {
+  textDocument: LspTextDocumentIdentifier;
+  edits: LspTextEdit[];
+}
+
+interface LspWorkspaceEdit {
+  changes?: Record<string, LspTextEdit[]>;
+  documentChanges?: LspTextDocumentEdit[];
+}
+
+type LspPrepareRenameResponse = LspRange | { range: LspRange; placeholder?: string };
+
+interface LspCommand {
+  title: string;
+  command: string;
+  arguments?: unknown[];
+}
+
+interface LspCodeAction {
+  title: string;
+  kind?: string;
+  diagnostics?: unknown[];
+  isPreferred?: boolean;
+  edit?: LspWorkspaceEdit;
+  command?: LspCommand;
+}
+
 interface MonacoEditorProps {
   filePath: string;
   content: string;
@@ -392,6 +428,335 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
           },
         });
         disposablesRef.current.push(definitionDisposable);
+
+        // 4. Formatting Provider
+        const formattingDisposable = monaco.languages.registerDocumentFormattingEditProvider(lang, {
+          provideDocumentFormattingEdits: async (model) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspTextEdit[]>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/formatting',
+                params: {
+                  textDocument: { uri },
+                  options: {
+                    tabSize: model.getOptions().tabSize,
+                    insertSpaces: model.getOptions().insertSpaces,
+                  },
+                },
+              });
+
+              if (!response || !Array.isArray(response)) return [];
+
+              return response.map((edit: LspTextEdit) => ({
+                range: {
+                  startLineNumber: edit.range.start.line + 1,
+                  startColumn: edit.range.start.character + 1,
+                  endLineNumber: edit.range.end.line + 1,
+                  endColumn: edit.range.end.character + 1,
+                },
+                text: edit.newText,
+              }));
+            } catch (e) {
+              console.warn(`LSP Formatting failed for ${lang}:`, e);
+              return [];
+            }
+          },
+        });
+        disposablesRef.current.push(formattingDisposable);
+
+        // 5. Reference Provider
+        const referenceDisposable = monaco.languages.registerReferenceProvider(lang, {
+          provideReferences: async (model, position, context) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspLocation[]>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/references',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                  context: {
+                    includeDeclaration: context.includeDeclaration,
+                  },
+                },
+              });
+
+              if (!response || !Array.isArray(response)) return [];
+
+              return response.map((loc: LspLocation) => ({
+                uri: monaco.Uri.parse(loc.uri),
+                range: {
+                  startLineNumber: loc.range.start.line + 1,
+                  startColumn: loc.range.start.character + 1,
+                  endLineNumber: loc.range.end.line + 1,
+                  endColumn: loc.range.end.character + 1,
+                },
+              }));
+            } catch (e) {
+              console.warn(`LSP References failed for ${lang}:`, e);
+              return [];
+            }
+          },
+        });
+        disposablesRef.current.push(referenceDisposable);
+
+        // 6. Rename Provider
+        const renameDisposable = monaco.languages.registerRenameProvider(lang, {
+          provideRenameEdits: async (model, position, newName) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspWorkspaceEdit | null>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/rename',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                  newName,
+                },
+              });
+
+              if (!response) return null;
+
+              const edits: import('monaco-editor').languages.IWorkspaceTextEdit[] = [];
+
+              if (response.changes) {
+                for (const [fileUri, textEdits] of Object.entries(response.changes)) {
+                  if (Array.isArray(textEdits)) {
+                    textEdits.forEach((edit: LspTextEdit) => {
+                      edits.push({
+                        resource: monaco.Uri.parse(fileUri),
+                        versionId: undefined,
+                        textEdit: {
+                          range: {
+                            startLineNumber: edit.range.start.line + 1,
+                            startColumn: edit.range.start.character + 1,
+                            endLineNumber: edit.range.end.line + 1,
+                            endColumn: edit.range.end.character + 1,
+                          },
+                          text: edit.newText,
+                        },
+                      });
+                    });
+                  }
+                }
+              }
+
+              if (response.documentChanges && Array.isArray(response.documentChanges)) {
+                response.documentChanges.forEach((change: LspTextDocumentEdit) => {
+                  if (change.textDocument && Array.isArray(change.edits)) {
+                    const docUri = change.textDocument.uri;
+                    change.edits.forEach((edit: LspTextEdit) => {
+                      edits.push({
+                        resource: monaco.Uri.parse(docUri),
+                        versionId: undefined,
+                        textEdit: {
+                          range: {
+                            startLineNumber: edit.range.start.line + 1,
+                            startColumn: edit.range.start.character + 1,
+                            endLineNumber: edit.range.end.line + 1,
+                            endColumn: edit.range.end.character + 1,
+                          },
+                          text: edit.newText,
+                        },
+                      });
+                    });
+                  }
+                });
+              }
+
+              return { edits };
+            } catch (e) {
+              console.warn(`LSP Rename failed for ${lang}:`, e);
+              return null;
+            }
+          },
+          resolveRenameLocation: async (model, position) => {
+            try {
+              const uri = model.uri.toString();
+              const response = await invoke<LspPrepareRenameResponse | null>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/prepareRename',
+                params: {
+                  textDocument: { uri },
+                  position: { line: position.lineNumber - 1, character: position.column - 1 },
+                },
+              });
+
+              if (response === null) {
+                throw new Error("Cannot rename this element");
+              }
+
+              let range: LspRange | undefined;
+              let placeholder: string | undefined;
+              if (response) {
+                if ('range' in response) {
+                  range = (response as { range: LspRange }).range;
+                  placeholder = (response as { placeholder?: string }).placeholder;
+                } else if ('start' in response) {
+                  range = response as LspRange;
+                }
+              }
+
+              if (range && range.start) {
+                return {
+                  range: {
+                    startLineNumber: range.start.line + 1,
+                    startColumn: range.start.character + 1,
+                    endLineNumber: range.end.line + 1,
+                    endColumn: range.end.character + 1,
+                  },
+                  text: placeholder || model.getValueInRange({
+                    startLineNumber: range.start.line + 1,
+                    startColumn: range.start.character + 1,
+                    endLineNumber: range.end.line + 1,
+                    endColumn: range.end.character + 1,
+                  }),
+                };
+              }
+            } catch (e) {
+              // fallback
+            }
+
+            return {
+              range: new monaco.Range(
+                position.lineNumber,
+                position.column,
+                position.lineNumber,
+                position.column
+              ),
+              text: '',
+            };
+          },
+        });
+        disposablesRef.current.push(renameDisposable);
+
+        // 7. Code Action Provider
+        const codeActionDisposable = monaco.languages.registerCodeActionProvider(lang, {
+          provideCodeActions: async (model, range, context) => {
+            try {
+              const uri = model.uri.toString();
+              const lspDiagnostics = context.markers.map((marker) => ({
+                range: {
+                  start: { line: marker.startLineNumber - 1, character: marker.startColumn - 1 },
+                  end: { line: marker.endLineNumber - 1, character: marker.endColumn - 1 },
+                },
+                severity: marker.severity,
+                message: marker.message,
+                code: marker.code?.toString(),
+                source: marker.source,
+              }));
+
+              const response = await invoke<LspCodeAction[]>('lsp_send_request', {
+                language: lang === 'rust' ? 'rust' : 'typescript',
+                method: 'textDocument/codeAction',
+                params: {
+                  textDocument: { uri },
+                  range: {
+                    start: { line: range.startLineNumber - 1, character: range.startColumn - 1 },
+                    end: { line: range.endLineNumber - 1, character: range.endColumn - 1 },
+                  },
+                  context: {
+                    diagnostics: lspDiagnostics,
+                    only: context.only ? [context.only] : undefined,
+                  },
+                },
+              });
+
+              if (!response || !Array.isArray(response)) return { actions: [], dispose: () => {} };
+
+              const actions: import('monaco-editor').languages.CodeAction[] = [];
+
+              response.forEach((action: LspCodeAction) => {
+                const edits: import('monaco-editor').languages.IWorkspaceTextEdit[] = [];
+
+                if (action.edit) {
+                  if (action.edit.changes) {
+                    for (const [fileUri, textEdits] of Object.entries(action.edit.changes)) {
+                      if (Array.isArray(textEdits)) {
+                        textEdits.forEach((edit: LspTextEdit) => {
+                          edits.push({
+                            resource: monaco.Uri.parse(fileUri),
+                            versionId: undefined,
+                            textEdit: {
+                              range: {
+                                startLineNumber: edit.range.start.line + 1,
+                                startColumn: edit.range.start.character + 1,
+                                endLineNumber: edit.range.end.line + 1,
+                                endColumn: edit.range.end.character + 1,
+                              },
+                              text: edit.newText,
+                            },
+                          });
+                        });
+                      }
+                    }
+                  }
+                  if (action.edit.documentChanges && Array.isArray(action.edit.documentChanges)) {
+                    action.edit.documentChanges.forEach((change: LspTextDocumentEdit) => {
+                      if (change.textDocument && Array.isArray(change.edits)) {
+                        const docUri = change.textDocument.uri;
+                        change.edits.forEach((edit: LspTextEdit) => {
+                          edits.push({
+                            resource: monaco.Uri.parse(docUri),
+                            versionId: undefined,
+                            textEdit: {
+                              range: {
+                                startLineNumber: edit.range.start.line + 1,
+                                startColumn: edit.range.start.character + 1,
+                                endLineNumber: edit.range.end.line + 1,
+                                endColumn: edit.range.end.character + 1,
+                              },
+                              text: edit.newText,
+                            },
+                          });
+                        });
+                      }
+                    });
+                  }
+                }
+
+                const actionObj: import('monaco-editor').languages.CodeAction = {
+                  title: action.title,
+                };
+
+                if (action.kind !== undefined) {
+                  actionObj.kind = action.kind;
+                }
+                if (context.markers !== undefined) {
+                  actionObj.diagnostics = context.markers;
+                }
+                if (action.isPreferred !== undefined) {
+                  actionObj.isPreferred = action.isPreferred;
+                }
+                if (edits.length > 0) {
+                  actionObj.edit = { edits };
+                }
+                if (action.command) {
+                  const cmdObj: import('monaco-editor').languages.Command = {
+                    id: action.command.command,
+                    title: action.command.title,
+                  };
+                  if (action.command.arguments !== undefined) {
+                    cmdObj.arguments = action.command.arguments as unknown[];
+                  }
+                  actionObj.command = cmdObj;
+                }
+
+                actions.push(actionObj);
+              });
+
+              return {
+                actions,
+                dispose: () => {},
+              };
+            } catch (e) {
+              console.warn(`LSP Code Actions failed for ${lang}:`, e);
+              return { actions: [], dispose: () => {} };
+            }
+          },
+        });
+        disposablesRef.current.push(codeActionDisposable);
       });
     }
   };

@@ -29,7 +29,7 @@ pub struct AppState {
     pub watcher_handle: std::sync::Arc<Mutex<Option<WatcherHandle>>>,
     pub db_conn: std::sync::Arc<Mutex<Option<rusqlite::Connection>>>,
     pub lsp_clients: std::sync::Arc<
-        Mutex<Option<std::collections::HashMap<String, std::sync::Arc<lsp::LspClient>>>>,
+        Mutex<Option<std::collections::HashMap<(String, String), std::sync::Arc<lsp::LspClient>>>>,
     >,
 }
 
@@ -301,12 +301,12 @@ fn save_config(
         // Clean up previous LSP clients
         let mut clients = state.lsp_clients.lock().unwrap();
         if let Some(map) = clients.as_mut() {
-            for (lang, client) in map.drain() {
+            for ((ws_root, lang), client) in map.drain() {
                 // Spawn shutdown in background so we don't block workspace save on I/O
                 tokio::spawn(async move {
                     let _ = client.shutdown().await;
                 });
-                logs.push(format!("Stopped previous LSP client: {}", lang));
+                logs.push(format!("Stopped previous LSP client: {} (workspace: {})", lang, ws_root));
             }
         }
     }
@@ -1034,6 +1034,58 @@ async fn self_healing_loop(
             }
         };
 
+        let mut quickfix_applied = false;
+        let language = match file_path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+            "rs" => Some("rust"),
+            "ts" | "tsx" | "js" | "jsx" => Some("typescript"),
+            _ => None,
+        };
+
+        if let Some(lang) = language {
+            let client_opt = {
+                let clients = state.lsp_clients.lock().unwrap();
+                clients.as_ref().and_then(|map| {
+                    map.iter()
+                        .find(|((ws_root, l), _)| ws_root == &workspace && l == lang)
+                        .map(|(_, c)| c.clone())
+                })
+            };
+
+            if let Some(client) = client_opt {
+                if let Some((line, col)) = find_error_location_in_stderr(&stderr_output, &file_path) {
+                    let _ = channel.send(format!(
+                        "[Self-Healing Engine] Found compiler error at {}:{}:{}. Checking LSP quick-fixes...",
+                        file_path.file_name().unwrap_or_default().to_string_lossy(),
+                        line,
+                        col
+                    ));
+                    match try_lsp_quickfix(&client, &file_path, line, col, &channel).await {
+                        Ok(true) => {
+                            quickfix_applied = true;
+                        }
+                        Ok(false) => {
+                            let _ = channel.send("[Self-Healing Engine] No quick-fixes available from LSP. Falling back to LLM...".to_string());
+                        }
+                        Err(e) => {
+                            let _ = channel.send(format!(
+                                "[Self-Healing Engine] LSP quick-fix query encountered an error: {}. Falling back to LLM...",
+                                e
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if quickfix_applied {
+            // We successfully applied a quick-fix. Re-run compilation directly!
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Applied LSP quick-fix to '{}'. Re-running compiler immediately...",
+                file_name
+            ));
+            continue;
+        }
+
         let _ = channel.send(format!(
             "[Self-Healing Engine] Isolated failing file: '{}'. Querying code fix from LLM ({}/{})...",
             file_name, provider, model.as_deref().unwrap_or("default")
@@ -1365,6 +1417,327 @@ fn git_rollback_to_commit_cmd(
     crate::git::git_rollback_to_commit(&ws, &commit_hash)
 }
 
+fn get_lsp_client_for_path(
+    state: &AppState,
+    language: &str,
+    path: &str,
+) -> Result<std::sync::Arc<lsp::LspClient>, String> {
+    let clients = state.lsp_clients.lock().unwrap();
+    let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+
+    // Find by path prefix matching workspace_root
+    for ((ws_root, lang), client) in map {
+        if path.starts_with(ws_root) && lang == language {
+            return Ok(client.clone());
+        }
+    }
+
+    // Fallback to active workspace_root
+    let global_ws = state.workspace_root.lock().unwrap().clone();
+    if let Some(client) = map.get(&(global_ws, language.to_string())) {
+        return Ok(client.clone());
+    }
+
+    Err("LSP server not running for this workspace/language".to_string())
+}
+
+fn get_lsp_client_for_request(
+    state: &AppState,
+    language: &str,
+    params: &serde_json::Value,
+) -> Result<std::sync::Arc<lsp::LspClient>, String> {
+    // Attempt to extract textDocument/uri
+    let path_opt = params
+        .get("textDocument")
+        .and_then(|td| td.get("uri"))
+        .and_then(|u| u.as_str())
+        .and_then(|uri| {
+            if let Ok(url) = tauri::Url::parse(uri) {
+                if let Ok(path) = url.to_file_path() {
+                    return Some(path.to_string_lossy().to_string());
+                }
+            }
+            None
+        });
+
+    if let Some(ref path) = path_opt {
+        get_lsp_client_for_path(state, language, path)
+    } else {
+        // Fallback to active workspace root
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        let global_ws = state.workspace_root.lock().unwrap().clone();
+        map.get(&(global_ws, language.to_string()))
+            .cloned()
+            .ok_or("LSP server not running for active workspace".to_string())
+    }
+}
+
+fn find_error_location_in_stderr(stderr: &str, file_path: &Path) -> Option<(usize, usize)> {
+    let file_name = file_path.file_name()?.to_str()?;
+    for line in stderr.lines() {
+        if line.contains(file_name) {
+            if let Some(idx) = line.find(file_name) {
+                let suffix = &line[idx + file_name.len()..];
+                if suffix.starts_with(':') {
+                    let parts: Vec<&str> = suffix[1..].split(':').collect();
+                    if !parts.is_empty() {
+                        if let Ok(line_num) = parts[0].trim().parse::<usize>() {
+                            let col_num = if parts.len() >= 2 {
+                                parts[1].trim().trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap_or(1)
+                            } else {
+                                1
+                            };
+                            return Some((line_num, col_num));
+                        }
+                    }
+                }
+                if suffix.starts_with('(') {
+                    if let Some(inside) = suffix[1..].split(')').next() {
+                        let parts: Vec<&str> = inside.split(',').collect();
+                        if !parts.is_empty() {
+                            if let Ok(line_num) = parts[0].trim().parse::<usize>() {
+                                let col_num = if parts.len() >= 2 {
+                                    parts[1].trim().parse::<usize>().unwrap_or(1)
+                                } else {
+                                    1
+                                };
+                                return Some((line_num, col_num));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn try_lsp_quickfix(
+    client: &lsp::LspClient,
+    file_path: &Path,
+    line: usize,
+    col: usize,
+    channel: &tauri::ipc::Channel<String>,
+) -> Result<bool, String> {
+    let uri = format!("file:///{}", file_path.to_string_lossy().replace('\\', "/"));
+    let content = std::fs::read_to_string(file_path)
+        .map_err(|e| format!("Failed to read file for LSP sync: {}", e))?;
+
+    // Sync file content with LSP server first
+    let path_str = file_path.to_string_lossy().to_string();
+    let _ = client.file_change(&path_str, None, &content).await;
+
+    let line_0 = line.saturating_sub(1);
+    let col_0 = col.saturating_sub(1);
+
+    let ranges = vec![
+        // Exact position
+        serde_json::json!({
+            "start": { "line": line_0, "character": col_0 },
+            "end": { "line": line_0, "character": col_0 }
+        }),
+        // Whole line
+        serde_json::json!({
+            "start": { "line": line_0, "character": 0 },
+            "end": { "line": line_0, "character": 999 }
+        }),
+        // Surrounding block
+        serde_json::json!({
+            "start": { "line": line_0.saturating_sub(5), "character": 0 },
+            "end": { "line": line_0 + 5, "character": 999 }
+        })
+    ];
+
+    for (idx, range) in ranges.into_iter().enumerate() {
+        let params = serde_json::json!({
+            "textDocument": { "uri": &uri },
+            "range": range,
+            "context": {
+                "diagnostics": [],
+                "only": ["quickfix"]
+            }
+        });
+
+        let _ = channel.send(format!(
+            "[Self-Healing Engine] Querying LSP Quick-Fixes (attempt {}/3 at line {})...",
+            idx + 1,
+            range["start"]["line"].as_u64().unwrap_or(0) + 1
+        ));
+
+        match client.send_request("textDocument/codeAction", params).await {
+            Ok(actions_val) => {
+                if let Some(actions) = actions_val.as_array() {
+                    for action in actions {
+                        let is_quickfix = action.get("kind")
+                            .and_then(|k| k.as_str())
+                            .map(|k| k.contains("quickfix"))
+                            .unwrap_or(true);
+
+                        if is_quickfix {
+                            if let Some(edit) = action.get("edit") {
+                                if apply_workspace_edit(edit).is_ok() {
+                                    let title = action.get("title").and_then(|t| t.as_str()).unwrap_or("LSP Quick-Fix");
+                                    let _ = channel.send(format!(
+                                        "[Self-Healing Engine] Successfully applied LSP Quick-Fix: '{}'",
+                                        title
+                                    ));
+                                    return Ok(true);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] LSP codeAction request failed: {}",
+                    e
+                ));
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
+    let mut file_edits: std::collections::HashMap<PathBuf, Vec<LocalTextEdit>> = std::collections::HashMap::new();
+
+    if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
+        for (uri, edits_val) in changes {
+            if let Ok(url) = tauri::Url::parse(uri) {
+                if let Ok(path) = url.to_file_path() {
+                    if let Some(edits_arr) = edits_val.as_array() {
+                        for edit_val in edits_arr {
+                            if let Some(local_edit) = parse_local_edit(edit_val) {
+                                file_edits.entry(path.clone()).or_default().push(local_edit);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(doc_changes) = edit.get("documentChanges").and_then(|dc| dc.as_array()) {
+        for change_val in doc_changes {
+            if let Some(text_doc) = change_val.get("textDocument") {
+                if let Some(uri) = text_doc.get("uri").and_then(|u| u.as_str()) {
+                    if let Ok(url) = tauri::Url::parse(uri) {
+                        if let Ok(path) = url.to_file_path() {
+                            if let Some(edits_val) = change_val.get("edits").and_then(|e| e.as_array()) {
+                                for edit_val in edits_val {
+                                    if let Some(local_edit) = parse_local_edit(edit_val) {
+                                        file_edits.entry(path.clone()).or_default().push(local_edit);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if file_edits.is_empty() {
+        return Err("No edits found in WorkspaceEdit".to_string());
+    }
+
+    for (path, mut edits) in file_edits {
+        let mut content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read target file {:?}: {}", path, e))?;
+
+        edits.sort_by(|a, b| {
+            b.start_line.cmp(&a.start_line)
+                .then_with(|| b.start_char.cmp(&a.start_char))
+        });
+
+        for edit in edits {
+            apply_local_edit_to_string(&mut content, edit)?;
+        }
+
+        std::fs::write(&path, content)
+            .map_err(|e| format!("Failed to write target file {:?}: {}", path, e))?;
+    }
+
+    Ok(())
+}
+
+struct LocalTextEdit {
+    start_line: usize,
+    start_char: usize,
+    end_line: usize,
+    end_char: usize,
+    new_text: String,
+}
+
+fn parse_local_edit(val: &serde_json::Value) -> Option<LocalTextEdit> {
+    let range = val.get("range")?;
+    let start = range.get("start")?;
+    let end = range.get("end")?;
+    let start_line = start.get("line")?.as_u64()? as usize;
+    let start_char = start.get("character")?.as_u64()? as usize;
+    let end_line = end.get("line")?.as_u64()? as usize;
+    let end_char = end.get("character")?.as_u64()? as usize;
+    let new_text = val.get("newText")?.as_str()?.to_string();
+
+    Some(LocalTextEdit {
+        start_line,
+        start_char,
+        end_line,
+        end_char,
+        new_text,
+    })
+}
+
+fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Result<(), String> {
+    let lines: Vec<&str> = content.split('\n').collect();
+
+    if edit.start_line >= lines.len() || edit.end_line >= lines.len() {
+        return Err("Edit coordinates out of bounds".to_string());
+    }
+
+    let start_byte = utf16_char_to_utf8_byte_offset_main(lines[edit.start_line], edit.start_char)?;
+    let end_byte = utf16_char_to_utf8_byte_offset_main(lines[edit.end_line], edit.end_char)?;
+
+    let mut new_content = String::new();
+    for i in 0..edit.start_line {
+        new_content.push_str(lines[i]);
+        new_content.push('\n');
+    }
+
+    let start_line_str = lines[edit.start_line];
+    new_content.push_str(&start_line_str[..start_byte]);
+    new_content.push_str(&edit.new_text);
+
+    let end_line_str = lines[edit.end_line];
+    new_content.push_str(&end_line_str[end_byte..]);
+
+    for i in (edit.end_line + 1)..lines.len() {
+        new_content.push('\n');
+        new_content.push_str(lines[i]);
+    }
+
+    *content = new_content;
+    Ok(())
+}
+
+fn utf16_char_to_utf8_byte_offset_main(line: &str, utf16_char_offset: usize) -> Result<usize, String> {
+    let mut utf16_count = 0;
+    let mut byte_count = 0;
+
+    for c in line.chars() {
+        if utf16_count >= utf16_char_offset {
+            break;
+        }
+        utf16_count += c.len_utf16();
+        byte_count += c.len_utf8();
+    }
+
+    Ok(byte_count)
+}
+
 #[tauri::command]
 async fn lsp_start(
     language: String,
@@ -1372,10 +1745,11 @@ async fn lsp_start(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    let key = (root_path.clone(), language.clone());
     let already_running = {
         let clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.contains_key(&language)
+        map.contains_key(&key)
     };
 
     if already_running {
@@ -1391,7 +1765,7 @@ async fn lsp_start(
     {
         let mut clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
-        map.insert(language, client);
+        map.insert(key, client);
     }
     Ok(())
 }
@@ -1403,14 +1777,7 @@ async fn lsp_file_open(
     content: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = {
-        let clients = state.lsp_clients.lock().unwrap();
-        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language)
-            .cloned()
-            .ok_or("LSP server not running")?
-    };
-
+    let client = get_lsp_client_for_path(&state, &language, &path)?;
     client.file_open(&path, &content).await
 }
 
@@ -1422,14 +1789,7 @@ async fn lsp_file_change(
     text: String,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = {
-        let clients = state.lsp_clients.lock().unwrap();
-        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language)
-            .cloned()
-            .ok_or("LSP server not running")?
-    };
-
+    let client = get_lsp_client_for_path(&state, &language, &path)?;
     client.file_change(&path, range, &text).await
 }
 
@@ -1440,14 +1800,7 @@ async fn lsp_file_save(
     content: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    let client = {
-        let clients = state.lsp_clients.lock().unwrap();
-        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language)
-            .cloned()
-            .ok_or("LSP server not running")?
-    };
-
+    let client = get_lsp_client_for_path(&state, &language, &path)?;
     client.file_save(&path, content.as_deref()).await
 }
 
@@ -1458,14 +1811,7 @@ async fn lsp_send_request(
     params: serde_json::Value,
     state: State<'_, AppState>,
 ) -> Result<serde_json::Value, String> {
-    let client = {
-        let clients = state.lsp_clients.lock().unwrap();
-        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
-        map.get(&language)
-            .cloned()
-            .ok_or("LSP server not running")?
-    };
-
+    let client = get_lsp_client_for_request(&state, &language, &params)?;
     client.send_request(&method, params).await
 }
 
@@ -1474,7 +1820,8 @@ async fn lsp_shutdown(language: String, state: State<'_, AppState>) -> Result<()
     let client = {
         let mut clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
-        map.remove(&language).ok_or("LSP server not running")?
+        let global_ws = state.workspace_root.lock().unwrap().clone();
+        map.remove(&(global_ws, language)).ok_or("LSP server not running")?
     };
 
     client.shutdown().await
