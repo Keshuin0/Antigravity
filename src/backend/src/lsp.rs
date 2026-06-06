@@ -333,7 +333,6 @@ impl LspClient {
         #[cfg(target_os = "windows")]
         let job_object = match win_job::JobObject::new() {
             Ok(job) => {
-                use std::os::windows::io::AsRawHandle;
                 if let Some(raw_handle) = child.raw_handle() {
                     let _ = job.assign_process(raw_handle as *mut std::os::raw::c_void);
                 }
