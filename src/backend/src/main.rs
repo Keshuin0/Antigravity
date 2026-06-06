@@ -8,21 +8,29 @@ pub mod inference;
 pub mod parser;
 pub mod security;
 pub mod watcher;
+pub mod lsp;
+
 
 use crate::cache::SymbolCache;
 use crate::watcher::WatcherHandle;
+use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use tauri::{Emitter, Manager, State};
 
 pub struct AppState {
     pub workspace_root: std::sync::Arc<Mutex<String>>,
+    pub llm_provider: std::sync::Arc<Mutex<String>>,
+    pub llm_endpoint: std::sync::Arc<Mutex<Option<String>>>,
+    pub llm_model: std::sync::Arc<Mutex<Option<String>>>,
     pub api_token: std::sync::Arc<Mutex<Option<crate::security::ObfBox>>>,
     pub logs: std::sync::Arc<Mutex<Vec<String>>>,
     pub symbol_cache: std::sync::Arc<Mutex<SymbolCache>>,
     pub watcher_handle: std::sync::Arc<Mutex<Option<WatcherHandle>>>,
     pub db_conn: std::sync::Arc<Mutex<Option<rusqlite::Connection>>>,
+    pub lsp_clients: std::sync::Arc<Mutex<Option<std::collections::HashMap<String, std::sync::Arc<lsp::LspClient>>>>>,
 }
+
 
 impl Default for AppState {
     fn default() -> Self {
@@ -30,6 +38,9 @@ impl Default for AppState {
             workspace_root: std::sync::Arc::new(Mutex::new(
                 "D:\\Project\\Antigravity SDK".to_string(),
             )),
+            llm_provider: std::sync::Arc::new(Mutex::new("gemini".to_string())),
+            llm_endpoint: std::sync::Arc::new(Mutex::new(None)),
+            llm_model: std::sync::Arc::new(Mutex::new(None)),
             api_token: std::sync::Arc::new(Mutex::new(None)),
             logs: std::sync::Arc::new(Mutex::new(vec![
                 "Antigravity workspace kernel booting...".to_string(),
@@ -42,7 +53,9 @@ impl Default for AppState {
             symbol_cache: std::sync::Arc::new(Mutex::new(SymbolCache::new(1000))),
             watcher_handle: std::sync::Arc::new(Mutex::new(None)),
             db_conn: std::sync::Arc::new(Mutex::new(None)),
+            lsp_clients: std::sync::Arc::new(Mutex::new(Some(std::collections::HashMap::new()))),
         }
+
     }
 }
 
@@ -100,6 +113,9 @@ fn crawl_workspace(dir: &Path, files: &mut Vec<PathBuf>) {
 async fn index_file(
     conn_mutex: &Mutex<Option<rusqlite::Connection>>,
     file_path: &Path,
+    provider: &str,
+    endpoint: Option<&str>,
+    model: Option<&str>,
     api_token: &crate::security::ObfBox,
 ) -> Result<usize, String> {
     let content =
@@ -139,7 +155,7 @@ async fn index_file(
     }
 
     let texts: Vec<String> = symbols_to_embed.iter().map(|s| s.content.clone()).collect();
-    let embeddings = embeddings::get_embeddings_batch(api_token, &texts).await?;
+    let embeddings = embeddings::get_embeddings_batch_multiplexed(provider, endpoint, model, api_token, &texts).await?;
 
     {
         let mut db_lock = conn_mutex.lock().unwrap();
@@ -191,6 +207,9 @@ fn get_symbols(state: State<'_, AppState>) -> Vec<FileSymbols> {
 #[tauri::command]
 fn save_config(
     workspace_root: String,
+    llm_provider: String,
+    llm_endpoint: Option<String>,
+    llm_model: Option<String>,
     mut api_token: String,
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
@@ -198,13 +217,19 @@ fn save_config(
     use zeroize::Zeroize;
 
     *state.workspace_root.lock().unwrap() = workspace_root.clone();
+    *state.llm_provider.lock().unwrap() = llm_provider.clone();
+    *state.llm_endpoint.lock().unwrap() = llm_endpoint.clone();
+    *state.llm_model.lock().unwrap() = llm_model.clone();
 
-    // 1. Persist workspace root to config.json
+    // 1. Persist workspace root and provider settings to config.json
     if let Ok(app_data) = app_handle.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&app_data);
         let config_path = app_data.join("config.json");
         let config = serde_json::json!({
-            "workspace_root": workspace_root
+            "workspace_root": workspace_root,
+            "llm_provider": llm_provider,
+            "llm_endpoint": llm_endpoint,
+            "llm_model": llm_model
         });
         if let Ok(content) = serde_json::to_string(&config) {
             let _ = std::fs::write(config_path, content);
@@ -213,23 +238,32 @@ fn save_config(
 
     // 2. Persist api_token to OS Keyring securely (or delete if empty)
     let mut logs = state.logs.lock().unwrap();
+    let key_name = if llm_provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+
     if api_token.trim().is_empty() {
-        let _ = crate::security::delete_api_token();
+        let _ = crate::security::delete_secure_token(key_name);
         *state.api_token.lock().unwrap() = None;
-        logs.push("Security: Gemini API Key deleted from secure storage.".to_string());
+        logs.push(format!("Security: API Key for '{}' deleted from secure storage.", key_name));
     } else if !api_token.starts_with('•') && !api_token.starts_with("•••") {
-        match crate::security::save_api_token(&api_token) {
+        match crate::security::save_secure_token(key_name, &api_token) {
             Ok(_) => {
                 let obf = crate::security::ObfBox::new(api_token.as_bytes());
                 *state.api_token.lock().unwrap() = Some(obf);
-                logs.push("Security: Saved API Key to OS Keyring successfully.".to_string());
+                logs.push(format!("Security: Saved API Key for '{}' to OS Keyring successfully.", key_name));
             }
             Err(e) => {
                 logs.push(format!(
-                    "Security: Failed to save API Key to OS Keyring: {}",
-                    e
+                    "Security: Failed to save API Key for '{}' to OS Keyring: {}",
+                    key_name, e
                 ));
             }
+        }
+    } else {
+        // Masked token: Load the existing key from the keyring for this provider
+        if let Ok(obf) = crate::security::load_secure_token(key_name) {
+            *state.api_token.lock().unwrap() = Some(obf);
+        } else {
+            *state.api_token.lock().unwrap() = None;
         }
     }
 
@@ -237,8 +271,8 @@ fn save_config(
     api_token.zeroize();
 
     logs.push(format!(
-        "Configuration updated. Workspace root set to: {}",
-        workspace_root
+        "Configuration updated. Workspace root: {}, Provider: {}",
+        workspace_root, llm_provider
     ));
 
     // Stop the previous watcher and database connection
@@ -251,6 +285,18 @@ fn save_config(
 
         let mut db_opt = state.db_conn.lock().unwrap();
         *db_opt = None;
+
+        // Clean up previous LSP clients
+        let mut clients = state.lsp_clients.lock().unwrap();
+        if let Some(map) = clients.as_mut() {
+            for (lang, client) in map.drain() {
+                // Spawn shutdown in background so we don't block workspace save on I/O
+                tokio::spawn(async move {
+                    let _ = client.shutdown().await;
+                });
+                logs.push(format!("Stopped previous LSP client: {}", lang));
+            }
+        }
     }
 
     // Clear the cache
@@ -308,6 +354,21 @@ async fn index_workspace(
         ws.clone()
     };
 
+    let provider = {
+        let p = state.llm_provider.lock().unwrap();
+        p.clone()
+    };
+
+    let endpoint = {
+        let e = state.llm_endpoint.lock().unwrap();
+        e.clone()
+    };
+
+    let model = {
+        let m = state.llm_model.lock().unwrap();
+        m.clone()
+    };
+
     let api_key_obf = {
         let key = state.api_token.lock().unwrap();
         key.clone()
@@ -316,15 +377,24 @@ async fn index_workspace(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-                let obf = crate::security::ObfBox::new(env_key.as_bytes());
-                *state.api_token.lock().unwrap() = Some(obf.clone());
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                let mut key_lock = state.api_token.lock().unwrap();
+                *key_lock = Some(obf.clone());
                 obf
             } else {
-                return Err(
-                    "Gemini API key is not configured. Please supply a key in Configuration settings."
-                        .to_string(),
-                );
+                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    let obf = crate::security::ObfBox::new(env_key.as_bytes());
+                    let mut key_lock = state.api_token.lock().unwrap();
+                    *key_lock = Some(obf.clone());
+                    obf
+                } else {
+                    return Err(format!(
+                        "API key is not configured for provider '{}'. Please supply a key in Configuration settings.",
+                        provider
+                    ));
+                }
             }
         }
     };
@@ -342,6 +412,10 @@ async fn index_workspace(
         let mut logs = state.logs.lock().unwrap();
         logs.push("Database: Commencing full workspace vector crawl...".to_string());
     }
+
+    let provider_clone = provider.clone();
+    let endpoint_clone = endpoint.clone();
+    let model_clone = model.clone();
 
     // Non-blocking background worker execution
     tokio::spawn(async move {
@@ -366,7 +440,14 @@ async fn index_workspace(
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            match index_file(&db_conn, file, &final_api_key).await {
+            match index_file(
+                &db_conn,
+                file,
+                &provider_clone,
+                endpoint_clone.as_deref(),
+                model_clone.as_deref(),
+                &final_api_key,
+            ).await {
                 Ok(count) => {
                     if count > 0 {
                         updated_count += count;
@@ -414,6 +495,10 @@ async fn search_symbols(
     limit: i32,
     state: State<'_, AppState>,
 ) -> Result<Vec<db::SearchResult>, String> {
+    let provider = state.llm_provider.lock().unwrap().clone();
+    let endpoint = state.llm_endpoint.lock().unwrap().clone();
+    let model = state.llm_model.lock().unwrap().clone();
+
     let api_key_obf = {
         let key = state.api_token.lock().unwrap();
         key.clone()
@@ -422,22 +507,37 @@ async fn search_symbols(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-                let obf = crate::security::ObfBox::new(env_key.as_bytes());
-                *state.api_token.lock().unwrap() = Some(obf.clone());
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                let mut key_lock = state.api_token.lock().unwrap();
+                *key_lock = Some(obf.clone());
                 obf
             } else {
-                return Err(
-                    "Gemini API key is not configured. Please supply a key in Configuration settings."
-                        .to_string(),
-                );
+                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    let obf = crate::security::ObfBox::new(env_key.as_bytes());
+                    let mut key_lock = state.api_token.lock().unwrap();
+                    *key_lock = Some(obf.clone());
+                    obf
+                } else {
+                    return Err(format!(
+                        "API key is not configured for provider '{}'. Please supply a key in Configuration settings.",
+                        provider
+                    ));
+                }
             }
         }
     };
 
-    let embedding = embeddings::get_embedding(&final_api_key, &query)
-        .await
-        .map_err(|e| format!("Embedding generation failed: {}", e))?;
+    let embedding = embeddings::get_embedding_multiplexed(
+        &provider,
+        endpoint.as_deref(),
+        model.as_deref(),
+        &final_api_key,
+        &query,
+    )
+    .await
+    .map_err(|e| format!("Embedding generation failed: {}", e))?;
 
     let db_lock = state.db_conn.lock().unwrap();
     let conn = db_lock
@@ -643,10 +743,26 @@ async fn self_healing_loop(
     command: String,
     channel: tauri::ipc::Channel<String>,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
     let workspace = {
         let ws = state.workspace_root.lock().unwrap();
         ws.clone()
+    };
+
+    let provider = {
+        let p = state.llm_provider.lock().unwrap();
+        p.clone()
+    };
+
+    let endpoint = {
+        let e = state.llm_endpoint.lock().unwrap();
+        e.clone()
+    };
+
+    let model = {
+        let m = state.llm_model.lock().unwrap();
+        m.clone()
     };
 
     let api_key_obf = {
@@ -657,10 +773,24 @@ async fn self_healing_loop(
     let final_api_key = match api_key_obf {
         Some(obf) => obf,
         None => {
-            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-                crate::security::ObfBox::new(env_key.as_bytes())
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                let mut key_lock = state.api_token.lock().unwrap();
+                *key_lock = Some(obf.clone());
+                obf
             } else {
-                return Err("Gemini API key is not configured. Self-healing aborted.".to_string());
+                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    let obf = crate::security::ObfBox::new(env_key.as_bytes());
+                    let mut key_lock = state.api_token.lock().unwrap();
+                    *key_lock = Some(obf.clone());
+                    obf
+                } else {
+                    return Err(format!(
+                        "API key is not configured for provider '{}'. Please supply a key in Configuration settings.",
+                        provider
+                    ));
+                }
             }
         }
     };
@@ -764,7 +894,7 @@ async fn self_healing_loop(
                         if crate::git::git_checkout_branch(&workspace, orig).is_ok() {
                             for (rel_path, content) in &modified_files {
                                 let abs_path = Path::new(&workspace).join(rel_path);
-                                let _ = std::fs::write(&abs_path, content);
+                                  let _ = std::fs::write(&abs_path, content);
                             }
 
                             let paths_to_stage: Vec<String> =
@@ -854,8 +984,8 @@ async fn self_healing_loop(
         };
 
         let _ = channel.send(format!(
-            "[Self-Healing Engine] Isolated failing file: '{}'. Querying code fix from Gemini...",
-            file_name
+            "[Self-Healing Engine] Isolated failing file: '{}'. Querying code fix from LLM ({}/{})...",
+            file_name, provider, model.as_deref().unwrap_or("default")
         ));
 
         let prompt = format!(
@@ -884,9 +1014,22 @@ async fn self_healing_loop(
         let api_key_clone = final_api_key.clone();
         let stream_tx_clone = stream_tx.clone();
 
+        let provider_clone = provider.clone();
+        let endpoint_clone = endpoint.clone();
+        let model_clone = model.clone();
+        let app_handle_clone = app_handle.clone();
+
         tokio::spawn(async move {
             let _ =
-                crate::inference::stream_generate_content(&api_key_clone, &prompt, api_tx).await;
+                crate::inference::stream_generate_content_multiplexed(
+                    &provider_clone,
+                    endpoint_clone.as_deref(),
+                    model_clone.as_deref(),
+                    &api_key_clone,
+                    &prompt,
+                    api_tx,
+                    Some(app_handle_clone),
+                ).await;
         });
 
         while let Some(token) = api_rx.recv().await {
@@ -899,11 +1042,11 @@ async fn self_healing_loop(
 
         let patched_code = extract_markdown_code_block(&collected_response);
         if patched_code.trim().is_empty() {
-            let _ = channel.send("[Self-Healing Engine] Gemini returned empty or invalid patch format. Healing failed.".to_string());
+            let _ = channel.send("[Self-Healing Engine] LLM returned empty or invalid patch format. Healing failed.".to_string());
             if is_git {
                 rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
-            return Err("Gemini returned invalid patch format".to_string());
+            return Err("LLM returned invalid patch format".to_string());
         }
 
         if let Err(e) = std::fs::write(&file_path, &patched_code) {
@@ -929,8 +1072,9 @@ async fn execute_command_stream(
     command: String,
     channel: tauri::ipc::Channel<String>,
     state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
 ) -> Result<String, String> {
-    self_healing_loop(command, channel, state).await
+    self_healing_loop(command, channel, state, app_handle).await
 }
 
 #[tauri::command]
@@ -970,15 +1114,24 @@ fn execute_command(command: String, state: State<'_, AppState>) -> Result<String
 #[derive(serde::Serialize)]
 struct ConfigPayload {
     workspace_root: String,
+    llm_provider: String,
+    llm_endpoint: Option<String>,
+    llm_model: Option<String>,
     has_key: bool,
 }
 
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> ConfigPayload {
     let ws = state.workspace_root.lock().unwrap().clone();
+    let provider = state.llm_provider.lock().unwrap().clone();
+    let endpoint = state.llm_endpoint.lock().unwrap().clone();
+    let model = state.llm_model.lock().unwrap().clone();
     let has_k = state.api_token.lock().unwrap().is_some();
     ConfigPayload {
         workspace_root: ws,
+        llm_provider: provider,
+        llm_endpoint: endpoint,
+        llm_model: model,
         has_key: has_k,
     }
 }
@@ -1102,6 +1255,283 @@ fn git_rollback_to_commit_cmd(
     crate::git::git_rollback_to_commit(&ws, &commit_hash)
 }
 
+#[tauri::command]
+async fn lsp_start(
+    language: String,
+    root_path: String,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let already_running = {
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        map.contains_key(&language)
+    };
+
+    if already_running {
+        return Ok(());
+    }
+
+    let client = lsp::LspClient::start(&language, &root_path, app_handle)?;
+    
+    // Initialize the server
+    let root_uri = format!("file:///{}", root_path.replace('\\', "/"));
+    client.initialize(&root_uri).await?;
+
+    {
+        let mut clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
+        map.insert(language, client);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn lsp_file_open(
+    language: String,
+    path: String,
+    content: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let client = {
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        map.get(&language).cloned().ok_or("LSP server not running")?
+    };
+
+    client.file_open(&path, &content).await
+}
+
+#[tauri::command]
+async fn lsp_file_change(
+    language: String,
+    path: String,
+    range: Option<serde_json::Value>,
+    text: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let client = {
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        map.get(&language).cloned().ok_or("LSP server not running")?
+    };
+
+    client.file_change(&path, range, &text).await
+}
+
+#[tauri::command]
+async fn lsp_file_save(
+    language: String,
+    path: String,
+    content: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let client = {
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        map.get(&language).cloned().ok_or("LSP server not running")?
+    };
+
+    client.file_save(&path, content.as_deref()).await
+}
+
+
+#[tauri::command]
+async fn lsp_send_request(
+    language: String,
+    method: String,
+    params: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
+    let client = {
+        let clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_ref().ok_or("LSP clients map not initialized")?;
+        map.get(&language).cloned().ok_or("LSP server not running")?
+    };
+
+    client.send_request(&method, params).await
+}
+
+#[tauri::command]
+async fn lsp_shutdown(
+    language: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let client = {
+        let mut clients = state.lsp_clients.lock().unwrap();
+        let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
+        map.remove(&language).ok_or("LSP server not running")?
+    };
+
+    client.shutdown().await
+}
+
+
+#[derive(serde::Serialize)]
+struct TestConnectionResult {
+    success: bool,
+    latency_ms: u64,
+    error: Option<String>,
+}
+
+#[tauri::command]
+async fn test_llm_connection(
+    state: State<'_, AppState>,
+) -> Result<TestConnectionResult, String> {
+    let provider = state.llm_provider.lock().unwrap().clone();
+    let endpoint = state.llm_endpoint.lock().unwrap().clone();
+    let model = state.llm_model.lock().unwrap().clone();
+    let obf_key_opt = state.api_token.lock().unwrap().clone();
+
+    let api_key = match obf_key_opt {
+        Some(k) => k,
+        None => {
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                obf
+            } else {
+                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    crate::security::ObfBox::new(env_key.as_bytes())
+                } else {
+                    return Ok(TestConnectionResult {
+                        success: false,
+                        latency_ms: 0,
+                        error: Some("API Key is not configured.".to_string()),
+                    });
+                }
+            }
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+    let prompt = "respond with exactly the word ok";
+    let endpoint_url = endpoint.clone();
+    let model_name = model.clone();
+
+    let handle = tokio::spawn(async move {
+        crate::inference::stream_generate_content_multiplexed(
+            &provider,
+            endpoint_url.as_deref(),
+            model_name.as_deref(),
+            &api_key,
+            prompt,
+            tx,
+            None,
+        ).await
+    });
+
+    let mut got_response = false;
+    while let Some(msg) = rx.recv().await {
+        if !msg.is_empty() && !msg.contains("[Telemetry]") {
+            got_response = true;
+            break;
+        }
+    }
+
+    let _ = handle.await;
+    let latency = start.elapsed().as_millis() as u64;
+
+    if got_response {
+        Ok(TestConnectionResult {
+            success: true,
+            latency_ms: latency,
+            error: None,
+        })
+    } else {
+        Ok(TestConnectionResult {
+            success: false,
+            latency_ms: latency,
+            error: Some("No valid response received from LLM endpoint.".to_string()),
+        })
+    }
+}
+
+#[tauri::command]
+async fn discover_models(
+    endpoint: String,
+    api_key_str: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<Vec<String>, String> {
+    let client = crate::embeddings::build_http_client();
+
+    let key = if let Some(ref k) = api_key_str {
+        if k.starts_with('•') || k.starts_with("•••") {
+            let provider = state.llm_provider.lock().unwrap().clone();
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                let decrypted = obf.decrypt();
+                String::from_utf8(decrypted).unwrap_or_default()
+            } else {
+                String::new()
+            }
+        } else {
+            k.clone()
+        }
+    } else {
+        let obf_key_opt = state.api_token.lock().unwrap().clone();
+        if let Some(obf) = obf_key_opt {
+            let decrypted = obf.decrypt();
+            String::from_utf8(decrypted).unwrap_or_default()
+        } else {
+            String::new()
+        }
+    };
+
+    let mut base_url = endpoint.clone();
+    if base_url.ends_with("/chat/completions") {
+        base_url = base_url.replace("/chat/completions", "");
+    }
+    if base_url.ends_with("/embeddings") {
+        base_url = base_url.replace("/embeddings", "");
+    }
+
+    if !base_url.ends_with('/') {
+        base_url.push('/');
+    }
+    let models_url = if base_url.ends_with("/v1/") {
+        format!("{}models", base_url)
+    } else {
+        format!("{}v1/models", base_url)
+    };
+
+    let mut req = client.get(&models_url);
+    if !key.trim().is_empty() {
+        req = req.bearer_auth(&key);
+    }
+
+    let response = req
+        .send()
+        .await
+        .map_err(|e| format!("Failed to connect to autodiscovery endpoint ({}): {}", models_url, e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let err_text = response.text().await.unwrap_or_default();
+        return Err(format!("Model discovery failed ({}): {}", status, err_text));
+    }
+
+    #[derive(Deserialize)]
+    struct ModelItem {
+        id: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ModelsResponse {
+        data: Vec<ModelItem>,
+    }
+
+    let result: ModelsResponse = response
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse models JSON: {}", e))?;
+
+    let models = result.data.into_iter().map(|m| m.id).collect();
+    Ok(models)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -1109,7 +1539,7 @@ fn main() {
             let state = app.state::<AppState>();
             let app_handle = app.handle().clone();
 
-            // 1. Try to load workspace_root from local config.json
+            // 1. Try to load config from local config.json
             if let Ok(app_data) = app_handle.path().app_data_dir() {
                 let config_path = app_data.join("config.json");
                 if config_path.exists() {
@@ -1117,6 +1547,15 @@ fn main() {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
                             if let Some(ws) = val.get("workspace_root").and_then(|v| v.as_str()) {
                                 *state.workspace_root.lock().unwrap() = ws.to_string();
+                            }
+                            if let Some(prov) = val.get("llm_provider").and_then(|v| v.as_str()) {
+                                *state.llm_provider.lock().unwrap() = prov.to_string();
+                            }
+                            if let Some(end) = val.get("llm_endpoint").and_then(|v| v.as_str()) {
+                                *state.llm_endpoint.lock().unwrap() = Some(end.to_string());
+                            }
+                            if let Some(mdl) = val.get("llm_model").and_then(|v| v.as_str()) {
+                                *state.llm_model.lock().unwrap() = Some(mdl.to_string());
                             }
                         }
                     }
@@ -1128,14 +1567,17 @@ fn main() {
                 ws.clone()
             };
 
-            // 2. Try to load API token from OS Keyring
-            if let Ok(obf) = crate::security::load_api_token() {
+            let provider = state.llm_provider.lock().unwrap().clone();
+            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+
+            // 2. Try to load API token from OS Keyring for active provider partition
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 *state.api_token.lock().unwrap() = Some(obf);
                 let mut logs = state.logs.lock().unwrap();
-                logs.push("Security: Restored Gemini API Key from secure OS Keyring.".to_string());
+                logs.push(format!("Security: Restored API Key for '{}' from secure OS Keyring.", key_name));
             } else {
                 let mut logs = state.logs.lock().unwrap();
-                logs.push("Security: No Gemini API Key found in OS Keyring. Please configure one in Settings.".to_string());
+                logs.push(format!("Security: No API Key for '{}' found in OS Keyring. Please configure one in Settings.", key_name));
             }
 
             // Initialize DB
@@ -1191,7 +1633,15 @@ fn main() {
             git_rollback_to_commit_cmd,
             read_workspace_file_cmd,
             write_workspace_file_cmd,
-            read_workspace_dir_cmd
+            read_workspace_dir_cmd,
+            lsp_start,
+            lsp_file_open,
+            lsp_file_change,
+            lsp_file_save,
+            lsp_send_request,
+            lsp_shutdown,
+            test_llm_connection,
+            discover_models
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

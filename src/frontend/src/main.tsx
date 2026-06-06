@@ -41,6 +41,26 @@ interface SearchResult {
   similarity: number;
 }
 
+interface LspPosition {
+  line: number;
+  character: number;
+}
+
+interface LspRange {
+  start: LspPosition;
+  end: LspPosition;
+}
+
+interface LspDiagnostic {
+  range: LspRange;
+  severity?: number;
+  code?: string | number;
+  source?: string;
+  message: string;
+  tags?: number[];
+  relatedInformation?: unknown[];
+}
+
 const parseAnsi = (text: string): React.ReactNode => {
   /* eslint-disable-next-line no-control-regex */
   const parts = text.split(/(\u001b\[[0-9;]*m)/g);
@@ -123,6 +143,13 @@ const App: React.FC = () => {
   );
   const [workspaceRoot, setWorkspaceRoot] = useState<string>('D:\\Project\\Antigravity SDK');
   const [apiToken, setApiToken] = useState<string>('••••••••••••••••••••••••');
+  const [llmProvider, setLlmProvider] = useState<string>('gemini');
+  const [llmEndpoint, setLlmEndpoint] = useState<string>('http://localhost:8000/v1');
+  const [llmModel, setLlmModel] = useState<string>('');
+  const [llmModelsList, setLlmModelsList] = useState<string[]>([]);
+  const [llmTestStatus, setLlmTestStatus] = useState<string | null>(null);
+  const [liveTtft, setLiveTtft] = useState<number | null>(null);
+  const [liveTps, setLiveTps] = useState<number | null>(null);
   const [commandInput, setCommandInput] = useState<string>('cargo build --release');
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [fileChanges, setFileChanges] = useState<FileChangeEvent[]>([]);
@@ -142,6 +169,8 @@ const App: React.FC = () => {
   const [activeFileContent, setActiveFileContent] = useState<string>('');
   const [originalFileContent, setOriginalFileContent] = useState<string>('');
   const [openTabs, setOpenTabs] = useState<string[]>([]);
+  const [diagnostics, setDiagnostics] = useState<Record<string, LspDiagnostic[]>>({});
+
 
   // Ref locks
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -201,8 +230,17 @@ const App: React.FC = () => {
   const loadConfig = useCallback(async () => {
     if (!isTauri) return;
     try {
-      const payload = await invoke<{ workspace_root: string; has_key: boolean }>('get_config');
+      const payload = await invoke<{
+        workspace_root: string;
+        llm_provider: string;
+        llm_endpoint: string | null;
+        llm_model: string | null;
+        has_key: boolean;
+      }>('get_config');
       setWorkspaceRoot(payload.workspace_root);
+      setLlmProvider(payload.llm_provider);
+      setLlmEndpoint(payload.llm_endpoint || 'http://localhost:8000/v1');
+      setLlmModel(payload.llm_model || '');
       if (payload.has_key) {
         setApiToken('••••••••••••••••••••••••');
       } else {
@@ -212,6 +250,32 @@ const App: React.FC = () => {
       console.error('Failed to load configuration:', e);
     }
   }, []);
+
+  // Spawns backend language server processes
+  const startLspServers = useCallback(async (root: string) => {
+    if (!isTauri || !root) return;
+    try {
+      addLog('info', `LSP: Initiating compiler server boot sequences for root: ${root}`);
+      await invoke('lsp_start', { language: 'rust', rootPath: root });
+      addLog('success', 'LSP: rust-analyzer booted and initialized successfully.');
+    } catch (e) {
+      addLog('info', `LSP Alert: rust-analyzer server could not start: ${e}`);
+    }
+
+    try {
+      await invoke('lsp_start', { language: 'typescript', rootPath: root });
+      addLog('success', 'LSP: typescript-language-server booted and initialized successfully.');
+    } catch (e) {
+      addLog('info', `LSP Alert: typescript-language-server could not start: ${e}`);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (workspaceRoot) {
+      startLspServers(workspaceRoot);
+    }
+  }, [workspaceRoot, startLspServers]);
+
 
   // Fetch symbol tree
   const loadSymbols = useCallback(async () => {
@@ -243,6 +307,9 @@ const App: React.FC = () => {
     let unlistenWatcher: (() => void) | null = null;
     let unlistenLogs: (() => void) | null = null;
     let unlistenIndex: (() => void) | null = null;
+    let unlistenLsp: (() => void) | null = null;
+    let unlistenTtft: (() => void) | null = null;
+    let unlistenTps: (() => void) | null = null;
 
     const setupListeners = async () => {
       if (!isTauri) return;
@@ -279,6 +346,21 @@ const App: React.FC = () => {
         setIsIndexing(false);
         loadSymbols();
       });
+
+      unlistenLsp = await listen<{ uri: string; diagnostics: LspDiagnostic[] }>('lsp-diagnostics', (event) => {
+        setDiagnostics((prev) => ({
+          ...prev,
+          [event.payload.uri]: event.payload.diagnostics,
+        }));
+      });
+
+      unlistenTtft = await listen<number>('llm-ttft', (event) => {
+        setLiveTtft(event.payload);
+      });
+
+      unlistenTps = await listen<number>('llm-tps', (event) => {
+        setLiveTps(event.payload);
+      });
     };
 
     setupListeners();
@@ -287,6 +369,9 @@ const App: React.FC = () => {
       if (unlistenWatcher) unlistenWatcher();
       if (unlistenLogs) unlistenLogs();
       if (unlistenIndex) unlistenIndex();
+      if (unlistenLsp) unlistenLsp();
+      if (unlistenTtft) unlistenTtft();
+      if (unlistenTps) unlistenTps();
     };
   }, [loadSymbols]);
 
@@ -304,6 +389,17 @@ const App: React.FC = () => {
       setActiveFileContent(content);
       setOriginalFileContent(content);
       addLog('watcher', `VFS: Loaded code buffer for ${filePath.split('\\').pop() || filePath.split('/').pop()}`);
+
+      // LSP notification didOpen
+      if (isTauri) {
+        const ext = filePath.split('.').pop()?.toLowerCase();
+        const lang = ext === 'rs' ? 'rust' : (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') ? 'typescript' : null;
+        if (lang) {
+          invoke('lsp_file_open', { language: lang, path: filePath, content }).catch((err) => {
+            console.warn('LSP file open failed:', err);
+          });
+        }
+      }
     } catch (err) {
       addLog('error', `VFS Error: Failed to open file: ${err}`);
     }
@@ -316,10 +412,22 @@ const App: React.FC = () => {
       await invoke('write_workspace_file_cmd', { path: activeFilePath, content: activeFileContent });
       setOriginalFileContent(activeFileContent);
       addLog('success', `VFS: Saved modifications to disk for ${activeFilePath.split('\\').pop() || activeFilePath.split('/').pop()}`);
+
+      // LSP notification didSave
+      if (isTauri) {
+        const ext = activeFilePath.split('.').pop()?.toLowerCase();
+        const lang = ext === 'rs' ? 'rust' : (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') ? 'typescript' : null;
+        if (lang) {
+          invoke('lsp_file_save', { language: lang, path: activeFilePath, content: activeFileContent }).catch((err) => {
+            console.warn('LSP file save failed:', err);
+          });
+        }
+      }
     } catch (err) {
       addLog('error', `VFS Error: Failed to save file changes: ${err}`);
     }
   };
+
 
   // Close tab handler
   const handleCloseTab = (filePath: string, e: React.MouseEvent) => {
@@ -462,12 +570,61 @@ const App: React.FC = () => {
     try {
       const res = await invoke<string>('save_config', {
         workspaceRoot,
+        llmProvider,
+        llmEndpoint: llmEndpoint || null,
+        llmModel: llmModel || null,
         apiToken,
       });
       addLog('success', `Configuration: ${res}`);
       loadConfig();
     } catch (e) {
       addLog('error', `Configuration Error: Save settings failed: ${e}`);
+    }
+  };
+
+  // Model autodiscovery
+  const handleDiscoverModels = async () => {
+    if (!llmEndpoint) {
+      addLog('warn', 'Autodiscovery: Please specify an endpoint URL first.');
+      return;
+    }
+    setLlmTestStatus('Discovering...');
+    try {
+      const models = await invoke<string[]>('discover_models', {
+        endpoint: llmEndpoint,
+        apiKeyStr: apiToken.trim() && !apiToken.startsWith('•') ? apiToken : null,
+      });
+      setLlmModelsList(models);
+      if (models.length > 0) {
+        setLlmTestStatus(`Discovered ${models.length} models.`);
+        const firstModel = models[0];
+        if (firstModel && !models.includes(llmModel)) {
+          setLlmModel(firstModel);
+        }
+      } else {
+        setLlmTestStatus('No models returned.');
+      }
+    } catch (e) {
+      setLlmTestStatus(`Discovery failed: ${e}`);
+      addLog('error', `Model Discovery Error: ${e}`);
+    }
+  };
+
+  // Test LLM Connection
+  const handleTestConnection = async () => {
+    setLlmTestStatus('Testing...');
+    try {
+      const result = await invoke<{ success: boolean; latency_ms: number; error: string | null }>('test_llm_connection');
+      if (result.success) {
+        setLlmTestStatus(`Success (${result.latency_ms}ms)`);
+        addLog('success', `LLM Connection Test: Successful. Latency: ${result.latency_ms}ms.`);
+      } else {
+        setLlmTestStatus(`Failed: ${result.error}`);
+        addLog('error', `LLM Connection Test: Failed. Error: ${result.error}`);
+      }
+    } catch (e) {
+      setLlmTestStatus(`Error: ${e}`);
+      addLog('error', `LLM Connection Test Error: ${e}`);
     }
   };
 
@@ -699,24 +856,127 @@ const App: React.FC = () => {
 
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-semibold text-white/40 uppercase tracking-wider block">
-                      Gemini API Key
+                      AI Provider
+                    </label>
+                    <select
+                      value={llmProvider}
+                      onChange={(e) => {
+                        const newProvider = e.target.value;
+                        setLlmProvider(newProvider);
+                        setApiToken('••••••••••••••••••••••••');
+                      }}
+                      className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white"
+                    >
+                      <option value="gemini">Gemini Cloud API</option>
+                      <option value="openai">Local LLM / NVIDIA GPU NIM</option>
+                    </select>
+                  </div>
+
+                  {llmProvider === 'openai' && (
+                    <>
+                      <div className="space-y-1.5">
+                        <label className="text-[10px] font-semibold text-white/40 uppercase tracking-wider block">
+                          Endpoint URL
+                        </label>
+                        <input
+                          type="text"
+                          value={llmEndpoint}
+                          onChange={(e) => setLlmEndpoint(e.target.value)}
+                          placeholder="e.g. http://localhost:8000/v1"
+                          className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white font-mono"
+                        />
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <div className="flex justify-between items-center">
+                          <label className="text-[10px] font-semibold text-white/40 uppercase tracking-wider block">
+                            Model Name
+                          </label>
+                          <button
+                            onClick={handleDiscoverModels}
+                            className="text-[9px] text-cyan-400 hover:underline cursor-pointer"
+                          >
+                            Autodiscover
+                          </button>
+                        </div>
+                        {llmModelsList.length > 0 ? (
+                          <select
+                            value={llmModel}
+                            onChange={(e) => setLlmModel(e.target.value)}
+                            className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white"
+                          >
+                            {llmModelsList.map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                        ) : (
+                          <input
+                            type="text"
+                            value={llmModel}
+                            onChange={(e) => setLlmModel(e.target.value)}
+                            placeholder="e.g. nvidia/llama-3.1-inst-70b"
+                            className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white font-mono"
+                          />
+                        )}
+                      </div>
+                    </>
+                  )}
+
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-semibold text-white/40 uppercase tracking-wider block">
+                      {llmProvider === 'openai' ? 'Local / NVIDIA API Key' : 'Gemini API Key'}
                     </label>
                     <input
                       type="password"
                       value={apiToken}
                       onChange={(e) => setApiToken(e.target.value)}
+                      placeholder={llmProvider === 'openai' ? 'Enter key (optional)' : 'Enter Gemini API key'}
                       className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white font-mono"
                     />
                   </div>
                 </div>
 
-                <div className="pt-4 border-t border-white/5">
+                <div className="pt-4 border-t border-white/5 space-y-3">
                   <button
                     onClick={handleSaveConfig}
                     className="w-full py-2.5 bg-gradient-to-tr from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-lg text-xs font-semibold active:scale-95 transition-all cursor-pointer shadow-md shadow-cyan-500/10"
                   >
                     Save Settings
                   </button>
+
+                  <button
+                    onClick={handleTestConnection}
+                    className="w-full py-2 bg-white/5 hover:bg-white/10 text-white rounded-lg text-[11px] font-mono border border-white/10 active:scale-95 transition-all cursor-pointer flex items-center justify-center space-x-2"
+                  >
+                    <span>⚡ Test Connection</span>
+                    {llmTestStatus && (
+                      <span className="text-[9px] text-cyan-400 font-semibold truncate max-w-[120px]">
+                        ({llmTestStatus})
+                      </span>
+                    )}
+                  </button>
+
+                  {(liveTtft !== null || liveTps !== null) && (
+                    <div className="p-3 bg-black/20 border border-white/5 rounded-lg space-y-2 mt-2">
+                      <span className="text-[9px] font-semibold text-white/30 uppercase tracking-wider block">
+                        Active Telemetry
+                      </span>
+                      <div className="grid grid-cols-2 gap-2 text-center">
+                        <div className="p-2 bg-white/3 rounded border border-white/5">
+                          <span className="text-[9px] text-white/50 block">TTFT</span>
+                          <span className="text-xs font-bold text-cyan-400 font-mono">
+                            {liveTtft !== null ? `${liveTtft.toFixed(3)}s` : '—'}
+                          </span>
+                        </div>
+                        <div className="p-2 bg-white/3 rounded border border-white/5">
+                          <span className="text-[9px] text-white/50 block">Speed</span>
+                          <span className="text-xs font-bold text-emerald-400 font-mono">
+                            {liveTps !== null ? `${liveTps.toFixed(1)} T/s` : '—'}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
                 
                 <div className="pt-4">
@@ -790,7 +1050,9 @@ const App: React.FC = () => {
                       content={activeFileContent}
                       onContentChange={setActiveFileContent}
                       onSave={handleSaveActiveFile}
+                      diagnostics={diagnostics}
                     />
+
                   </div>
                 </div>
               ) : (

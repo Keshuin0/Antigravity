@@ -201,11 +201,11 @@ pub fn dpapi_decrypt(encrypted_data: &[u8]) -> Result<Vec<u8>, String> {
 
 // OS Keyring wrappers gated on target OS
 #[cfg(target_os = "windows")]
-pub fn save_api_token(token: &str) -> Result<(), String> {
+pub fn save_secure_token(key_name: &str, token: &str) -> Result<(), String> {
     let encrypted = dpapi_encrypt(token.as_bytes())?;
     let hex_encrypted = hex::encode(encrypted);
 
-    let entry = keyring::Entry::new("com.antigravity.workspace", "gemini_api_key")
+    let entry = keyring::Entry::new("com.antigravity.workspace", key_name)
         .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
 
     entry
@@ -216,14 +216,15 @@ pub fn save_api_token(token: &str) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn save_api_token(token: &str) -> Result<(), String> {
-    std::env::set_var("MOCK_GEMINI_API_KEY", token);
+pub fn save_secure_token(key_name: &str, token: &str) -> Result<(), String> {
+    let env_var = format!("MOCK_{}", key_name.to_uppercase());
+    std::env::set_var(env_var, token);
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-pub fn load_api_token() -> Result<ObfBox, String> {
-    let entry = keyring::Entry::new("com.antigravity.workspace", "gemini_api_key")
+pub fn load_secure_token(key_name: &str) -> Result<ObfBox, String> {
+    let entry = keyring::Entry::new("com.antigravity.workspace", key_name)
         .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
 
     let hex_encrypted = entry
@@ -239,28 +240,43 @@ pub fn load_api_token() -> Result<ObfBox, String> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn load_api_token() -> Result<ObfBox, String> {
-    if let Ok(key) = std::env::var("MOCK_GEMINI_API_KEY") {
+pub fn load_secure_token(key_name: &str) -> Result<ObfBox, String> {
+    let env_var = format!("MOCK_{}", key_name.to_uppercase());
+    if let Ok(key) = std::env::var(&env_var) {
         Ok(ObfBox::new(key.as_bytes()))
-    } else if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+    } else if let Ok(key) = std::env::var(key_name.to_uppercase()) {
         Ok(ObfBox::new(key.as_bytes()))
     } else {
-        Err("Keyring entry not found in environment".to_string())
+        Err(format!("Keyring entry {} not found in environment", env_var))
     }
 }
 
 #[cfg(target_os = "windows")]
-pub fn delete_api_token() -> Result<(), String> {
-    let entry = keyring::Entry::new("com.antigravity.workspace", "gemini_api_key")
+pub fn delete_secure_token(key_name: &str) -> Result<(), String> {
+    let entry = keyring::Entry::new("com.antigravity.workspace", key_name)
         .map_err(|e| format!("Failed to create keyring entry: {}", e))?;
     let _ = entry.delete_password();
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn delete_api_token() -> Result<(), String> {
-    std::env::remove_var("MOCK_GEMINI_API_KEY");
+pub fn delete_secure_token(key_name: &str) -> Result<(), String> {
+    let env_var = format!("MOCK_{}", key_name.to_uppercase());
+    std::env::remove_var(env_var);
     Ok(())
+}
+
+// Backwards compatibility wrappers
+pub fn save_api_token(token: &str) -> Result<(), String> {
+    save_secure_token("gemini_api_key", token)
+}
+
+pub fn load_api_token() -> Result<ObfBox, String> {
+    load_secure_token("gemini_api_key")
+}
+
+pub fn delete_api_token() -> Result<(), String> {
+    delete_secure_token("gemini_api_key")
 }
 
 #[cfg(test)]

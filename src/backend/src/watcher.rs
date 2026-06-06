@@ -195,6 +195,9 @@ async fn handle_debounced_changes(
                     let key = app_state.api_token.lock().unwrap();
                     key.clone()
                 };
+                let provider = app_state.llm_provider.lock().unwrap().clone();
+                let endpoint = app_state.llm_endpoint.lock().unwrap().clone();
+                let model = app_state.llm_model.lock().unwrap().clone();
 
                 let db_conn = app_state.db_conn.clone();
                 let logs_clone = app_state.logs.clone();
@@ -245,22 +248,33 @@ async fn handle_debounced_changes(
                     let final_api_key = match api_key_obf {
                         Some(obf) => obf,
                         None => {
-                            if let Ok(env_key) = std::env::var("GEMINI_API_KEY") {
-                                crate::security::ObfBox::new(env_key.as_bytes())
+                            let key_name = if provider == "openai" { "openai_api_key" } else { "gemini_api_key" };
+                            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                                obf
                             } else {
-                                let mut logs = logs_clone.lock().unwrap();
-                                logs.push(
-                                    "Watcher: Auto-indexing skipped. Gemini API key is missing."
-                                        .to_string(),
-                                );
-                                return;
+                                let env_name = if provider == "openai" { "OPENAI_API_KEY" } else { "GEMINI_API_KEY" };
+                                if let Ok(env_key) = std::env::var(env_name) {
+                                    crate::security::ObfBox::new(env_key.as_bytes())
+                                } else {
+                                    let mut logs = logs_clone.lock().unwrap();
+                                    logs.push(
+                                        format!("Watcher: Auto-indexing skipped. {} is missing.", key_name)
+                                    );
+                                    return;
+                                }
                             }
                         }
                     };
 
                     let texts: Vec<String> =
                         symbols_to_embed.iter().map(|s| s.content.clone()).collect();
-                    match crate::embeddings::get_embeddings_batch(&final_api_key, &texts).await {
+                    match crate::embeddings::get_embeddings_batch_multiplexed(
+                        &provider,
+                        endpoint.as_deref(),
+                        model.as_deref(),
+                        &final_api_key,
+                        &texts,
+                    ).await {
                         Ok(embeddings) => {
                             let mut db_lock = db_conn.lock().unwrap();
                             if let Some(conn) = db_lock.as_mut() {
