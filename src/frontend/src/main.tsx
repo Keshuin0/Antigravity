@@ -155,6 +155,7 @@ const App: React.FC = () => {
   const [fileChanges, setFileChanges] = useState<FileChangeEvent[]>([]);
   const [symbolIndex, setSymbolIndex] = useState<FileSymbols[]>([]);
   const [watcherActive, setWatcherActive] = useState(false);
+  const [attachedFiles, setAttachedFiles] = useState<{ name: string; path: string; mimeType: string; size: number }[]>([]);
   
   // Semantic Search States
   const [searchQuery, setSearchQuery] = useState<string>('');
@@ -451,7 +452,7 @@ const App: React.FC = () => {
     }
   };
 
-  // Trigger self-healing compiler loop
+  // Submit self-healing build execution
   const handleTestCommand = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!commandInput.trim()) return;
@@ -471,6 +472,30 @@ const App: React.FC = () => {
       return;
     }
 
+    // Process attachments: large files (>2MB) on Gemini are uploaded via Files API
+    const backendAttachments: { mime_type: string; data: string; path: string }[] = [];
+    for (const file of attachedFiles) {
+      let dataVal = "";
+      if (llmProvider === 'gemini' && file.size > 2 * 1024 * 1024) {
+        addLog('info', `Gemini Cloud: Uploading large attachment '${file.name}' to Google Files API...`);
+        try {
+          const uri = await invoke<string>('upload_file_to_gemini', { path: file.path });
+          dataVal = uri;
+          addLog('success', `Gemini Cloud: Uploaded '${file.name}' successfully. URI: ${uri}`);
+        } catch (err) {
+          addLog('error', `Failed to upload '${file.name}' to Gemini Files API: ${err}`);
+          setGeminiStatus('error');
+          isStreamingGeminiRef.current = false;
+          return;
+        }
+      }
+      backendAttachments.push({
+        mime_type: file.mimeType,
+        data: dataVal,
+        path: file.path,
+      });
+    }
+
     const channel = new Channel<string>();
     channel.onmessage = (message) => {
       // Print build stream directly to our logs panel
@@ -485,10 +510,12 @@ const App: React.FC = () => {
     try {
       const res = await invoke<string>('execute_command_stream', {
         command: commandInput,
+        attachments: backendAttachments.length > 0 ? backendAttachments : null,
         channel,
       });
       addLog('success', `Self-Healing Loop Result: ${res}`);
       setGeminiStatus('success');
+      setAttachedFiles([]); // Clear attached files on success
     } catch (err) {
       addLog('error', `Self-Healing Loop Aborted: ${err}`);
       setGeminiStatus('error');
@@ -497,6 +524,82 @@ const App: React.FC = () => {
       loadSymbols();
     }
   };
+
+  // Handle file attachment
+  const handleFileAttach = useCallback(async (filePath: string) => {
+    let isAlready = false;
+    setAttachedFiles((prev) => {
+      if (prev.some((f) => f.path === filePath)) {
+        isAlready = true;
+      }
+      return prev;
+    });
+
+    if (isAlready) {
+      addLog('warn', `Attachment: '${filePath}' is already attached.`);
+      return;
+    }
+
+    try {
+      const fileName = filePath.split(/[/\\]/).pop() || filePath;
+      addLog('info', `Attachment: Sniffing file type for '${fileName}'...`);
+      const sniffResult = await invoke<{ mime_type: string; size: number }>('sniff_file_type', { path: filePath });
+      setAttachedFiles((prev) => {
+        if (prev.some((f) => f.path === filePath)) return prev;
+        return [...prev, { name: fileName, path: filePath, mimeType: sniffResult.mime_type, size: sniffResult.size }];
+      });
+      addLog('success', `Attachment: Added '${fileName}' (${sniffResult.mime_type}, ${(sniffResult.size / 1024).toFixed(1)} KB).`);
+    } catch (e) {
+      addLog('error', `Attachment Error: Failed to attach file: ${e}`);
+    }
+  }, []);
+
+  // Open native file picker using RFD command
+  const handleOpenFilePicker = useCallback(async () => {
+    try {
+      const selectedPath = await invoke<string | null>('open_file_dialog');
+      if (selectedPath) {
+        await handleFileAttach(selectedPath);
+      }
+    } catch (err) {
+      addLog('error', `Attachment Error: Failed to open file picker: ${err}`);
+    }
+  }, [handleFileAttach]);
+
+  // Handle window drag and drop to attach files
+  useEffect(() => {
+    const handleDragOver = (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+    };
+
+    const handleDrop = async (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+
+      if (e.dataTransfer && e.dataTransfer.files.length > 0) {
+        for (let i = 0; i < e.dataTransfer.files.length; i++) {
+          const file = e.dataTransfer.files[i];
+          if (file) {
+            const filePath = (file as unknown as { path?: string }).path;
+            if (filePath) {
+              await handleFileAttach(filePath);
+            } else {
+              addLog('warn', `Attachment: Dropped file '${file.name}' does not have an absolute system path.`);
+            }
+          }
+        }
+      }
+    };
+
+    window.addEventListener('dragover', handleDragOver);
+    window.addEventListener('drop', handleDrop);
+
+    return () => {
+      window.removeEventListener('dragover', handleDragOver);
+      window.removeEventListener('drop', handleDrop);
+    };
+  }, [handleFileAttach]);
 
   // Re-Index Vector Database
   const handleReindex = async () => {
@@ -737,6 +840,7 @@ const App: React.FC = () => {
               workspaceRoot={workspaceRoot}
               onFileSelect={handleOpenFile}
               activeFilePath={activeFilePath}
+              onFileAttach={handleFileAttach}
             />
           )}
 
@@ -1288,6 +1392,24 @@ const App: React.FC = () => {
                 <div className="flex-1 min-h-0 flex overflow-hidden">
                   {activeConsoleTab === 'healer' ? (
                     <div className="flex-1 flex flex-col p-4 space-y-3 bg-[#05070a]/90 font-mono">
+                      {/* Attached Files Preview Chips */}
+                      {attachedFiles.length > 0 && (
+                        <div className="flex flex-wrap gap-2 pb-1 border-b border-white/5">
+                          {attachedFiles.map((file, idx) => (
+                            <div key={idx} className="flex items-center space-x-1.5 px-2.5 py-1 bg-white/5 border border-white/10 rounded-md text-[10px] text-cyan-400 font-mono transition-all hover:bg-white/10">
+                              <span>📎 {file.name} ({(file.size / 1024).toFixed(1)} KB)</span>
+                              <button
+                                type="button"
+                                onClick={() => setAttachedFiles(prev => prev.filter((_, i) => i !== idx))}
+                                className="text-neutral-400 hover:text-rose-400 font-bold cursor-pointer ml-1 text-xs"
+                              >
+                                &times;
+                              </button>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
                       {/* Form input */}
                       <form onSubmit={handleTestCommand} className="flex space-x-3 items-center flex-shrink-0">
                         <span className="text-xs text-cyan-400 font-bold">$</span>
@@ -1298,6 +1420,16 @@ const App: React.FC = () => {
                           className="flex-1 px-3 py-1.5 bg-black/40 border border-white/5 focus:border-cyan-500/30 outline-none rounded-md text-xs text-white font-mono"
                           placeholder="e.g. 'cargo build'"
                         />
+                        <button
+                          type="button"
+                          onClick={handleOpenFilePicker}
+                          className="p-1.5 bg-white/5 border border-white/10 hover:bg-white/10 text-neutral-400 hover:text-white rounded-md text-xs cursor-pointer flex items-center justify-center transition-all duration-200"
+                          title="Attach file to prompt"
+                        >
+                          <svg className="w-4 h-4 fill-current text-cyan-400" viewBox="0 0 24 24">
+                            <path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-3.31 2.69-6 6-6s6 2.69 6 6v10c0 4.42-3.58 8-8 8s-8-3.58-8-8V4h2v11c0 3.31 2.69 6 6 6s6-2.69 6-6V5c0-2.21-1.79-4-4-4s-4 1.79-4 4v12.5c0 1.1.9 2 2 2s2-.9 2-2V6h2z" />
+                          </svg>
+                        </button>
                         <button
                           type="submit"
                           disabled={geminiStatus === 'streaming'}

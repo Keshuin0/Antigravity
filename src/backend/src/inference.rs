@@ -1,14 +1,47 @@
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
+use std::path::Path;
 
-#[derive(Serialize)]
-struct ContentPart {
-    text: String,
+#[derive(Deserialize, Serialize, Clone, Debug)]
+pub struct Attachment {
+    pub mime_type: String,
+    pub data: String, // Hex/Base64 data or Gemini File URI
+    pub path: Option<String>, // Optional local file path for zero-copy native reading
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(untagged)]
+enum GeminiContentPart {
+    Text {
+        text: String,
+    },
+    InlineData {
+        #[serde(rename = "inlineData")]
+        inline_data: InlineData,
+    },
+    FileData {
+        #[serde(rename = "fileData")]
+        file_data: FileData,
+    },
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct InlineData {
+    mime_type: String,
+    data: String,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct FileData {
+    file_uri: String,
+    mime_type: String,
 }
 
 #[derive(Serialize)]
 struct Content {
-    parts: Vec<ContentPart>,
+    parts: Vec<GeminiContentPart>,
 }
 
 #[derive(Serialize)]
@@ -40,7 +73,7 @@ struct GenerateStreamResponse {
 #[derive(Serialize)]
 struct OpenAIChatMessage {
     role: String,
-    content: String,
+    content: serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -76,6 +109,7 @@ pub async fn stream_generate_content(
         None,
         api_key,
         prompt,
+        None,
         tx,
         None,
     ).await
@@ -87,6 +121,7 @@ pub async fn stream_generate_content_multiplexed(
     model: Option<&str>,
     api_key: &crate::security::ObfBox,
     prompt: &str,
+    attachments: Option<Vec<Attachment>>,
     tx: tokio::sync::mpsc::Sender<String>,
     app_handle: Option<tauri::AppHandle>,
 ) -> Result<(), String> {
@@ -100,6 +135,135 @@ pub async fn stream_generate_content_multiplexed(
     let key_str = std::str::from_utf8(&decrypted_key)
         .map_err(|e| format!("Invalid API key: {}", e))?;
 
+    let mut appended_text_context = String::new();
+    let mut gemini_parts = vec![GeminiContentPart::Text {
+        text: prompt.to_string(),
+    }];
+    let mut openai_contents = vec![serde_json::json!({
+        "type": "text",
+        "text": prompt
+    })];
+
+    if let Some(ref atts) = attachments {
+        for att in atts {
+            let (mime, bytes, is_local) = if let Some(ref path_str) = att.path {
+                if let Ok(b) = std::fs::read(path_str) {
+                    (att.mime_type.clone(), Some(b), true)
+                } else {
+                    (att.mime_type.clone(), None, false)
+                }
+            } else {
+                let decoded = base64_decode(&att.data).ok();
+                (att.mime_type.clone(), decoded, false)
+            };
+
+            let is_text = mime.starts_with("text/") || 
+                          mime == "application/json" || 
+                          mime == "application/javascript" || 
+                          mime == "text/plain";
+
+            if is_text {
+                if let Some(ref b) = bytes {
+                    if let Ok(text_content) = String::from_utf8(b.clone()) {
+                        let filename = att.path.as_ref()
+                            .and_then(|p| Path::new(p).file_name())
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "attachment".to_string());
+                        
+                        appended_text_context.push_str(&format!(
+                            "\n\n[Attached Document: {}]\n---\n{}\n---\n",
+                            filename, text_content
+                        ));
+                    }
+                }
+                continue;
+            }
+
+            if provider == "gemini" {
+                if att.data.starts_with("https://generativelanguage.googleapis.com") {
+                    gemini_parts.push(GeminiContentPart::FileData {
+                        file_data: FileData {
+                            file_uri: att.data.clone(),
+                            mime_type: mime,
+                        }
+                    });
+                } else if is_local && bytes.is_some() {
+                    let base_64 = base64_encode(bytes.as_ref().unwrap());
+                    gemini_parts.push(GeminiContentPart::InlineData {
+                        inline_data: InlineData {
+                            mime_type: mime,
+                            data: base_64,
+                        }
+                    });
+                } else if !att.data.is_empty() {
+                    gemini_parts.push(GeminiContentPart::InlineData {
+                        inline_data: InlineData {
+                            mime_type: mime,
+                            data: att.data.clone(),
+                        }
+                    });
+                }
+            } else {
+                // OpenAI / Local VLM
+                if mime.starts_with("image/") {
+                    let base_64 = if is_local && bytes.is_some() {
+                        base64_encode(bytes.as_ref().unwrap())
+                    } else {
+                        att.data.clone()
+                    };
+                    openai_contents.push(serde_json::json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", mime, base_64)
+                        }
+                    }));
+                } else {
+                    // Option 1 fallback: non-image document attached to local VLM
+                    let extracted = if mime == "application/pdf" {
+                        if let Some(ref path_str) = att.path {
+                            pdf_extract::extract_text(path_str).ok()
+                        } else if let Some(ref b) = bytes {
+                            pdf_extract::extract_text_from_mem(b).ok()
+                        } else {
+                            None
+                        }
+                    } else if let Some(ref b) = bytes {
+                        String::from_utf8(b.clone()).ok()
+                    } else {
+                        None
+                    };
+
+                    if let Some(text_content) = extracted {
+                        let filename = att.path.as_ref()
+                            .and_then(|p| Path::new(p).file_name())
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "attachment".to_string());
+                        
+                        appended_text_context.push_str(&format!(
+                            "\n\n[Attached Document: {}]\n---\n{}\n---\n",
+                            filename, text_content
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Append text context to prompts if any was extracted
+    if !appended_text_context.is_empty() {
+        if let Some(GeminiContentPart::Text { ref mut text }) = gemini_parts.first_mut() {
+            text.push_str(&appended_text_context);
+        }
+        if let Some(first_content) = openai_contents.first_mut() {
+            if let Some(text_val) = first_content.get_mut("text") {
+                if let Some(t_str) = text_val.as_str() {
+                    let new_text = format!("{}{}", t_str, appended_text_context);
+                    *text_val = serde_json::json!(new_text);
+                }
+            }
+        }
+    }
+
     let response = if provider == "gemini" {
         let url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-pro:streamGenerateContent";
         let mut header_val = reqwest::header::HeaderValue::from_bytes(&decrypted_key)
@@ -108,9 +272,7 @@ pub async fn stream_generate_content_multiplexed(
 
         let payload = GenerateRequest {
             contents: vec![Content {
-                parts: vec![ContentPart {
-                    text: prompt.to_string(),
-                }],
+                parts: gemini_parts,
             }],
         };
 
@@ -129,7 +291,7 @@ pub async fn stream_generate_content_multiplexed(
             model: model_name.to_string(),
             messages: vec![OpenAIChatMessage {
                 role: "user".to_string(),
-                content: prompt.to_string(),
+                content: serde_json::json!(openai_contents),
             }],
             stream: true,
         };
@@ -295,6 +457,16 @@ fn trim_byte_slice(mut slice: &[u8]) -> &[u8] {
         slice = &slice[..slice.len() - 1];
     }
     slice
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.encode(bytes)
+}
+
+fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
+    use base64::{Engine as _, engine::general_purpose};
+    general_purpose::STANDARD.decode(s).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

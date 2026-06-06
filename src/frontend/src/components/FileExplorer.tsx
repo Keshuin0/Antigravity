@@ -11,6 +11,7 @@ interface FileExplorerProps {
   workspaceRoot: string;
   onFileSelect: (filePath: string) => void;
   activeFilePath: string | null;
+  onFileAttach?: ((filePath: string) => void) | undefined;
 }
 
 interface TreeNodeProps {
@@ -18,9 +19,10 @@ interface TreeNodeProps {
   depth: number;
   onFileSelect: (filePath: string) => void;
   activeFilePath: string | null;
+  onFileAttach?: ((filePath: string) => void) | undefined;
 }
 
-const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeFilePath }) => {
+const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeFilePath, onFileAttach }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [children, setChildren] = useState<VfsEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -91,6 +93,22 @@ const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeF
 
         {/* Label */}
         <span className="truncate flex-1">{entry.name}</span>
+
+        {/* Paperclip Attach Button (only for files) */}
+        {!entry.is_dir && onFileAttach && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onFileAttach(entry.path);
+            }}
+            className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-cyan-500/20 text-neutral-400 hover:text-cyan-400 transition-all duration-150"
+            title="Attach to session"
+          >
+            <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+              <path d="M16.5 6v11.5c0 2.21-1.79 4-4 4s-4-1.79-4-4V5c0-3.31 2.69-6 6-6s6 2.69 6 6v13c0 4.42-3.58 8-8 8s-8-3.58-8-8V6h2v12c0 3.31 2.69 6 6 6s6-2.69 6-6V5c0-2.21-1.79-4-4-4s-4 1.79-4 4v12.5c0 1.1.9 2 2 2s2-.9 2-2V6h2z" />
+            </svg>
+          </button>
+        )}
       </div>
 
       {/* Children List */}
@@ -124,6 +142,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeF
                 depth={depth + 1}
                 onFileSelect={onFileSelect}
                 activeFilePath={activeFilePath}
+                onFileAttach={onFileAttach}
               />
             ))
           )}
@@ -137,6 +156,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   workspaceRoot,
   onFileSelect,
   activeFilePath,
+  onFileAttach,
 }) => {
   const [rootEntries, setRootEntries] = useState<VfsEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -227,6 +247,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
               depth={0}
               onFileSelect={onFileSelect}
               activeFilePath={activeFilePath}
+              onFileAttach={onFileAttach}
             />
           ))
         )}
