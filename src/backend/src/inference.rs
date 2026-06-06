@@ -121,7 +121,11 @@ pub async fn stream_generate_content_multiplexed(
     let mut first_token_time: Option<std::time::Instant> = None;
     let mut token_count = 0;
 
-    let client = crate::embeddings::build_http_client();
+    let client = if provider == "gemini" {
+        crate::embeddings::build_http_client(false)
+    } else {
+        crate::embeddings::build_http_client(crate::embeddings::is_local_endpoint(endpoint))
+    };
 
     let decrypted_key = Zeroizing::new(api_key.decrypt());
     let key_str =

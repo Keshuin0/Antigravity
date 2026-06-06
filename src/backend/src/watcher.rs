@@ -335,7 +335,12 @@ async fn handle_debounced_changes(
             let db_conn = app_state.db_conn.clone();
             let mut db_lock = db_conn.lock().unwrap();
             if let Some(conn) = db_lock.as_mut() {
-                let path_str = path.to_string_lossy().to_string();
+                let raw_path_str = path.to_string_lossy().to_string();
+                let path_str = if raw_path_str.starts_with(r"\\?\") {
+                    raw_path_str[4..].to_string()
+                } else {
+                    raw_path_str
+                };
                 let _ = conn.execute(
                     "DELETE FROM vec_symbols WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id = (SELECT id FROM files WHERE path = ?1));",
                     [&path_str],
