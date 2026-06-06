@@ -195,7 +195,9 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     if status.success() && local_bin_path.exists() {
         let state = app_handle.state::<crate::AppState>();
         let mut logs = state.logs.lock().unwrap();
-        logs.push("LSP [typescript]: Automatic local installation completed successfully.".to_string());
+        logs.push(
+            "LSP [typescript]: Automatic local installation completed successfully.".to_string(),
+        );
         Ok(local_bin_path)
     } else {
         Err(format!(
@@ -205,11 +207,31 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     }
 }
 
-fn apply_incremental_edit(content: &mut String, range_val: &Value, new_text: &str) -> Result<(), String> {
-    let start_line = range_val.get("start").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range start line")? as usize;
-    let start_char = range_val.get("start").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range start character")? as usize;
-    let end_line = range_val.get("end").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range end line")? as usize;
-    let end_char = range_val.get("end").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range end character")? as usize;
+fn apply_incremental_edit(
+    content: &mut String,
+    range_val: &Value,
+    new_text: &str,
+) -> Result<(), String> {
+    let start_line = range_val
+        .get("start")
+        .and_then(|pos| pos.get("line"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range start line")? as usize;
+    let start_char = range_val
+        .get("start")
+        .and_then(|pos| pos.get("character"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range start character")? as usize;
+    let end_line = range_val
+        .get("end")
+        .and_then(|pos| pos.get("line"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range end line")? as usize;
+    let end_char = range_val
+        .get("end")
+        .and_then(|pos| pos.get("character"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range end character")? as usize;
 
     let lines: Vec<&str> = content.split('\n').collect();
 
@@ -341,7 +363,10 @@ impl LspClient {
             Err(e) => {
                 let state = app_handle.state::<crate::AppState>();
                 let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("LSP warning: failed to create process sandbox: {}", e));
+                logs.push(format!(
+                    "LSP warning: failed to create process sandbox: {}",
+                    e
+                ));
                 None
             }
         };
@@ -547,7 +572,10 @@ impl LspClient {
                         {
                             let mut state_clients = state.lsp_clients.lock().unwrap();
                             if let Some(map) = state_clients.as_mut() {
-                                map.insert((root_path_mon.clone(), lang_name_mon.clone()), new_client.clone());
+                                map.insert(
+                                    (root_path_mon.clone(), lang_name_mon.clone()),
+                                    new_client.clone(),
+                                );
                             }
                         }
 
@@ -739,10 +767,13 @@ impl LspClient {
             if let Some(content) = files.get_mut(path) {
                 if let Some(ref r) = range {
                     if let Err(e) = apply_incremental_edit(content, r, text) {
-                        let _ = self.send_notification("telemetry/event", json!({
-                            "type": "error",
-                            "message": format!("LSP Incremental patch failed: {}", e)
-                        }));
+                        let _ = self.send_notification(
+                            "telemetry/event",
+                            json!({
+                                "type": "error",
+                                "message": format!("LSP Incremental patch failed: {}", e)
+                            }),
+                        );
                     }
                 } else {
                     // Full sync update
@@ -817,4 +848,3 @@ mod tests {
         assert_eq!(byte_offset_end, 10);
     }
 }
-

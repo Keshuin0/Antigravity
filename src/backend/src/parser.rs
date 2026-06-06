@@ -179,7 +179,12 @@ pub struct IsolatedScope {
     pub content: String,
 }
 
-pub fn isolate_ast_scope(path: &Path, content: &str, line: usize, col: usize) -> Option<IsolatedScope> {
+pub fn isolate_ast_scope(
+    path: &Path,
+    content: &str,
+    line: usize,
+    col: usize,
+) -> Option<IsolatedScope> {
     let language = get_language(path)?;
     let mut parser = Parser::new();
     parser.set_language(&language).ok()?;
@@ -221,7 +226,10 @@ pub fn isolate_ast_scope(path: &Path, content: &str, line: usize, col: usize) ->
     let kind = final_node.kind().to_string();
 
     let name = if let Some(name_node) = final_node.child_by_field_name("name") {
-        name_node.utf8_text(content.as_bytes()).unwrap_or("").to_string()
+        name_node
+            .utf8_text(content.as_bytes())
+            .unwrap_or("")
+            .to_string()
     } else {
         "".to_string()
     };
@@ -294,4 +302,3 @@ fn is_structural_scope(kind: &str, ext: &str) -> bool {
         _ => false,
     }
 }
-

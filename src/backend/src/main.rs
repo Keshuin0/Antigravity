@@ -306,7 +306,10 @@ fn save_config(
                 tokio::spawn(async move {
                     let _ = client.shutdown().await;
                 });
-                logs.push(format!("Stopped previous LSP client: {} (workspace: {})", lang, ws_root));
+                logs.push(format!(
+                    "Stopped previous LSP client: {} (workspace: {})",
+                    lang, ws_root
+                ));
             }
         }
     }
@@ -774,15 +777,23 @@ fn parse_error_coordinates(word: &str, workspace: &Path) -> Option<ParsedError> 
                     } else {
                         1
                     };
-                    
+
                     let path = Path::new(path_str);
                     let clean_path = crate::watcher::clean_unc_path(path);
                     if clean_path.is_file() && clean_path.starts_with(workspace) {
-                        return Some(ParsedError { file_path: clean_path, line, column: col });
+                        return Some(ParsedError {
+                            file_path: clean_path,
+                            line,
+                            column: col,
+                        });
                     }
                     let rel_path = workspace.join(path_str);
                     if rel_path.is_file() {
-                        return Some(ParsedError { file_path: crate::watcher::clean_unc_path(&rel_path), line, column: col });
+                        return Some(ParsedError {
+                            file_path: crate::watcher::clean_unc_path(&rel_path),
+                            line,
+                            column: col,
+                        });
                     }
                 }
             }
@@ -792,8 +803,9 @@ fn parse_error_coordinates(word: &str, workspace: &Path) -> Option<ParsedError> 
     // Handle general format: path:line:col
     let parts: Vec<&str> = cleaned_word.split(':').collect();
     if parts.len() >= 2 {
-        let is_windows_drive = parts[0].len() == 1 && parts[0].chars().next().unwrap().is_ascii_alphabetic();
-        
+        let is_windows_drive =
+            parts[0].len() == 1 && parts[0].chars().next().unwrap().is_ascii_alphabetic();
+
         let (path_str, line_idx, col_idx) = if is_windows_drive && parts.len() >= 3 {
             let full_path = format!("{}:{}", parts[0], parts[1]);
             (full_path, 2, 3)
@@ -804,7 +816,11 @@ fn parse_error_coordinates(word: &str, workspace: &Path) -> Option<ParsedError> 
         if line_idx < parts.len() {
             if let Ok(line) = parts[line_idx].trim().parse::<usize>() {
                 let col = if col_idx < parts.len() {
-                    parts[col_idx].trim().trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap_or(1)
+                    parts[col_idx]
+                        .trim()
+                        .trim_end_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .unwrap_or(1)
                 } else {
                     1
                 };
@@ -812,11 +828,19 @@ fn parse_error_coordinates(word: &str, workspace: &Path) -> Option<ParsedError> 
                 let path = Path::new(&path_str);
                 let clean_path = crate::watcher::clean_unc_path(path);
                 if clean_path.is_file() && clean_path.starts_with(workspace) {
-                    return Some(ParsedError { file_path: clean_path, line, column: col });
+                    return Some(ParsedError {
+                        file_path: clean_path,
+                        line,
+                        column: col,
+                    });
                 }
                 let rel_path = workspace.join(&path_str);
                 if rel_path.is_file() {
-                    return Some(ParsedError { file_path: crate::watcher::clean_unc_path(&rel_path), line, column: col });
+                    return Some(ParsedError {
+                        file_path: crate::watcher::clean_unc_path(&rel_path),
+                        line,
+                        column: col,
+                    });
                 }
             }
         }
@@ -843,7 +867,11 @@ fn find_all_error_locations(stderr: &str, workspace_root: &str) -> Vec<ParsedErr
 
         for word in line.split_whitespace() {
             if let Some(err) = parse_error_coordinates(word, &clean_workspace) {
-                if !locations.iter().any(|loc| loc.file_path == err.file_path && loc.line == err.line && loc.column == err.column) {
+                if !locations.iter().any(|loc| {
+                    loc.file_path == err.file_path
+                        && loc.line == err.line
+                        && loc.column == err.column
+                }) {
                     locations.push(err);
                 }
             }
@@ -859,18 +887,89 @@ fn extract_referenced_symbols(stderr: &str) -> std::collections::HashSet<String>
 
     for word in stripped.split_whitespace() {
         let cleaned = word.trim_matches(|c: char| {
-            c == '`' || c == '\'' || c == '"' || c == ':' || c == ',' || c == ';' || c == '.' || c == '(' || c == ')' || c == '{' || c == '}' || c == '[' || c == ']' || c == '<' || c == '>' || c == '?' || c == '!' || c == '*' || c == '&'
+            c == '`'
+                || c == '\''
+                || c == '"'
+                || c == ':'
+                || c == ','
+                || c == ';'
+                || c == '.'
+                || c == '('
+                || c == ')'
+                || c == '{'
+                || c == '}'
+                || c == '['
+                || c == ']'
+                || c == '<'
+                || c == '>'
+                || c == '?'
+                || c == '!'
+                || c == '*'
+                || c == '&'
         });
 
         if cleaned.len() >= 3 && cleaned.len() <= 64 {
             let mut chars = cleaned.chars();
             if let Some(first) = chars.next() {
-                if (first.is_ascii_alphabetic() || first == '_') && chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                if (first.is_ascii_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
                     let ignore_keywords = [
-                        "let", "mut", "struct", "class", "interface", "impl", "enum", "fn", "function", "let", "const", "var", "import", "export",
-                        "use", "pub", "std", "Result", "Option", "Vec", "String", "usize", "u8", "f32", "i64", "self", "Self", "return", "match",
-                        "if", "else", "true", "false", "for", "while", "loop", "break", "continue", "crate", "mod", "type", "as", "dyn", "where",
-                        "expect", "expected", "found", "mismatched", "types", "mismatch", "error", "warning", "compilation", "failed", "compiler"
+                        "let",
+                        "mut",
+                        "struct",
+                        "class",
+                        "interface",
+                        "impl",
+                        "enum",
+                        "fn",
+                        "function",
+                        "let",
+                        "const",
+                        "var",
+                        "import",
+                        "export",
+                        "use",
+                        "pub",
+                        "std",
+                        "Result",
+                        "Option",
+                        "Vec",
+                        "String",
+                        "usize",
+                        "u8",
+                        "f32",
+                        "i64",
+                        "self",
+                        "Self",
+                        "return",
+                        "match",
+                        "if",
+                        "else",
+                        "true",
+                        "false",
+                        "for",
+                        "while",
+                        "loop",
+                        "break",
+                        "continue",
+                        "crate",
+                        "mod",
+                        "type",
+                        "as",
+                        "dyn",
+                        "where",
+                        "expect",
+                        "expected",
+                        "found",
+                        "mismatched",
+                        "types",
+                        "mismatch",
+                        "error",
+                        "warning",
+                        "compilation",
+                        "failed",
+                        "compiler",
                     ];
                     if !ignore_keywords.contains(&cleaned) {
                         symbols.insert(cleaned.to_string());
@@ -883,26 +982,30 @@ fn extract_referenced_symbols(stderr: &str) -> std::collections::HashSet<String>
 }
 
 fn fetch_symbol_context(conn: &rusqlite::Connection, symbol_name: &str) -> Option<String> {
-    let mut stmt = conn.prepare(
-        "SELECT s.kind, f.path, f.content, s.start_line, s.end_line, s.signature 
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.kind, f.path, f.content, s.start_line, s.end_line, s.signature 
          FROM symbols s
          JOIN files f ON f.id = s.file_id
          WHERE s.name = ?1
-         LIMIT 1;"
-    ).ok()?;
+         LIMIT 1;",
+        )
+        .ok()?;
 
-    let row = stmt.query_row([symbol_name], |r| {
-        let kind: String = r.get(0)?;
-        let path: String = r.get(1)?;
-        let content: String = r.get(2)?;
-        let start_line: usize = r.get(3)?;
-        let end_line: usize = r.get(4)?;
-        let signature: Option<String> = r.get(5)?;
-        Ok((kind, path, content, start_line, end_line, signature))
-    }).ok()?;
+    let row = stmt
+        .query_row([symbol_name], |r| {
+            let kind: String = r.get(0)?;
+            let path: String = r.get(1)?;
+            let content: String = r.get(2)?;
+            let start_line: usize = r.get(3)?;
+            let end_line: usize = r.get(4)?;
+            let signature: Option<String> = r.get(5)?;
+            Ok((kind, path, content, start_line, end_line, signature))
+        })
+        .ok()?;
 
     let (kind, path_str, content, start, end, signature) = row;
-    
+
     let lines: Vec<&str> = content.lines().collect();
     let start_0 = start.saturating_sub(1);
     let end_limit = end.min(lines.len());
@@ -979,7 +1082,10 @@ fn insert_imports_to_source(content: &mut String, new_imports: &str, language: &
                 let mut cursor = root.walk();
                 for child in root.children(&mut cursor) {
                     let kind = child.kind();
-                    if kind == "inner_attribute_item" || kind == "line_comment" || kind == "block_comment" {
+                    if kind == "inner_attribute_item"
+                        || kind == "line_comment"
+                        || kind == "block_comment"
+                    {
                         insert_pos = child.end_byte();
                     } else {
                         break;
@@ -1013,7 +1119,10 @@ fn insert_imports_to_source(content: &mut String, new_imports: &str, language: &
 fn extract_json_from_response(s: &str) -> String {
     let mut cleaned = s.trim();
     if cleaned.starts_with("```") {
-        cleaned = cleaned.trim_start_matches('`').trim_start_matches("json").trim_start_matches(|c| c == '\n' || c == '\r');
+        cleaned = cleaned
+            .trim_start_matches('`')
+            .trim_start_matches("json")
+            .trim_start_matches(|c| c == '\n' || c == '\r');
         if let Some(end_pos) = cleaned.rfind("```") {
             cleaned = &cleaned[..end_pos];
         }
@@ -1379,7 +1488,7 @@ async fn self_healing_loop(
                 "File: {}\nScope Type: {}\nScope Name: {}\nLines: {}-{}\n",
                 file_name, scope.kind, scope.name, scope.start_line, scope.end_line
             );
-            
+
             let prompt = format!(
                 "You are Antigravity's autonomous self-healing compilation agent.\n\
                  A compiler check failed. Here is the stderr output:\n\
@@ -1451,7 +1560,8 @@ async fn self_healing_loop(
 
         let _ = channel.send(format!(
             "[Self-Healing Engine] Querying code fix from LLM ({}/{})...",
-            provider, model.as_deref().unwrap_or("default")
+            provider,
+            model.as_deref().unwrap_or("default")
         ));
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(100);
@@ -1506,17 +1616,23 @@ async fn self_healing_loop(
             if validate_patch_syntax(&patch.patched_code, syntax_lang) {
                 if let Some(ref scope) = isolated_scope {
                     let mut new_content = file_content.clone();
-                    if scope.start_byte <= new_content.len() && scope.end_byte <= new_content.len() {
-                        new_content.replace_range(scope.start_byte..scope.end_byte, &patch.patched_code);
+                    if scope.start_byte <= new_content.len() && scope.end_byte <= new_content.len()
+                    {
+                        new_content
+                            .replace_range(scope.start_byte..scope.end_byte, &patch.patched_code);
                         insert_imports_to_source(&mut new_content, &patch.new_imports, syntax_lang);
-                        
+
                         if let Err(e) = std::fs::write(&file_path, &new_content) {
                             let _ = channel.send(format!(
                                 "[Self-Healing Engine] Failed to write patched file to disk: {}",
                                 e
                             ));
                             if is_git {
-                                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                                rollback_and_cleanup_git(
+                                    &workspace,
+                                    original_branch.as_deref(),
+                                    temp_branch,
+                                );
                             }
                             return Err(format!("Failed to write patch: {}", e));
                         }
@@ -1533,7 +1649,11 @@ async fn self_healing_loop(
                             e
                         ));
                         if is_git {
-                            rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                            rollback_and_cleanup_git(
+                                &workspace,
+                                original_branch.as_deref(),
+                                temp_branch,
+                            );
                         }
                         return Err(format!("Failed to write patch: {}", e));
                     }
@@ -1559,7 +1679,11 @@ async fn self_healing_loop(
                         e
                     ));
                     if is_git {
-                        rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                        rollback_and_cleanup_git(
+                            &workspace,
+                            original_branch.as_deref(),
+                            temp_branch,
+                        );
                     }
                     return Err(format!("Failed to write fallback patch: {}", e));
                 }
@@ -1876,7 +2000,6 @@ fn get_lsp_client_for_request(
     }
 }
 
-
 async fn try_lsp_quickfix(
     client: &lsp::LspClient,
     file_path: &Path,
@@ -1910,7 +2033,7 @@ async fn try_lsp_quickfix(
         serde_json::json!({
             "start": { "line": line_0.saturating_sub(5), "character": 0 },
             "end": { "line": line_0 + 5, "character": 999 }
-        })
+        }),
     ];
 
     for (idx, range) in ranges.into_iter().enumerate() {
@@ -1933,7 +2056,8 @@ async fn try_lsp_quickfix(
             Ok(actions_val) => {
                 if let Some(actions) = actions_val.as_array() {
                     for action in actions {
-                        let is_quickfix = action.get("kind")
+                        let is_quickfix = action
+                            .get("kind")
                             .and_then(|k| k.as_str())
                             .map(|k| k.contains("quickfix"))
                             .unwrap_or(true);
@@ -1941,7 +2065,10 @@ async fn try_lsp_quickfix(
                         if is_quickfix {
                             if let Some(edit) = action.get("edit") {
                                 if apply_workspace_edit(edit).is_ok() {
-                                    let title = action.get("title").and_then(|t| t.as_str()).unwrap_or("LSP Quick-Fix");
+                                    let title = action
+                                        .get("title")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("LSP Quick-Fix");
                                     let _ = channel.send(format!(
                                         "[Self-Healing Engine] Successfully applied LSP Quick-Fix: '{}'",
                                         title
@@ -1966,7 +2093,8 @@ async fn try_lsp_quickfix(
 }
 
 fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
-    let mut file_edits: std::collections::HashMap<PathBuf, Vec<LocalTextEdit>> = std::collections::HashMap::new();
+    let mut file_edits: std::collections::HashMap<PathBuf, Vec<LocalTextEdit>> =
+        std::collections::HashMap::new();
 
     if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
         for (uri, edits_val) in changes {
@@ -1990,10 +2118,15 @@ fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
                 if let Some(uri) = text_doc.get("uri").and_then(|u| u.as_str()) {
                     if let Ok(url) = tauri::Url::parse(uri) {
                         if let Ok(path) = url.to_file_path() {
-                            if let Some(edits_val) = change_val.get("edits").and_then(|e| e.as_array()) {
+                            if let Some(edits_val) =
+                                change_val.get("edits").and_then(|e| e.as_array())
+                            {
                                 for edit_val in edits_val {
                                     if let Some(local_edit) = parse_local_edit(edit_val) {
-                                        file_edits.entry(path.clone()).or_default().push(local_edit);
+                                        file_edits
+                                            .entry(path.clone())
+                                            .or_default()
+                                            .push(local_edit);
                                     }
                                 }
                             }
@@ -2013,7 +2146,8 @@ fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("Failed to read target file {:?}: {}", path, e))?;
 
         edits.sort_by(|a, b| {
-            b.start_line.cmp(&a.start_line)
+            b.start_line
+                .cmp(&a.start_line)
                 .then_with(|| b.start_char.cmp(&a.start_char))
         });
 
@@ -2087,7 +2221,10 @@ fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Resu
     Ok(())
 }
 
-fn utf16_char_to_utf8_byte_offset_main(line: &str, utf16_char_offset: usize) -> Result<usize, String> {
+fn utf16_char_to_utf8_byte_offset_main(
+    line: &str,
+    utf16_char_offset: usize,
+) -> Result<usize, String> {
     let mut utf16_count = 0;
     let mut byte_count = 0;
 
@@ -2185,7 +2322,8 @@ async fn lsp_shutdown(language: String, state: State<'_, AppState>) -> Result<()
         let mut clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
         let global_ws = state.workspace_root.lock().unwrap().clone();
-        map.remove(&(global_ws, language)).ok_or("LSP server not running")?
+        map.remove(&(global_ws, language))
+            .ok_or("LSP server not running")?
     };
 
     client.shutdown().await
@@ -2716,10 +2854,10 @@ mod tests {
     #[test]
     fn test_coordinates_parsing() {
         let workspace = get_temp_test_dir();
-        
+
         let mock_file = workspace.join("mock_file.rs");
         std::fs::write(&mock_file, "fn main() {}").unwrap();
-        
+
         // Windows drive letters format
         let raw_path = mock_file.to_string_lossy().to_string();
         let word = format!("{}:12:34", raw_path);
