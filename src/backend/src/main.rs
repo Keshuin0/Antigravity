@@ -10,6 +10,7 @@ pub mod lsp;
 pub mod parser;
 pub mod sandbox;
 pub mod security;
+pub mod simd;
 pub mod watcher;
 
 use crate::cache::SymbolCache;
@@ -33,6 +34,7 @@ pub struct AppState {
     pub lsp_clients: std::sync::Arc<
         Mutex<Option<std::collections::HashMap<(String, String), std::sync::Arc<lsp::LspClient>>>>,
     >,
+    pub vector_cache: std::sync::Arc<Mutex<Vec<db::VectorCacheEntry>>>,
 }
 
 impl Default for AppState {
@@ -51,6 +53,7 @@ impl Default for AppState {
             watcher_handle: std::sync::Arc::new(Mutex::new(None)),
             db_conn: std::sync::Arc::new(Mutex::new(None)),
             lsp_clients: std::sync::Arc::new(Mutex::new(Some(std::collections::HashMap::new()))),
+            vector_cache: std::sync::Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -70,6 +73,21 @@ fn open_and_init_workspace_db(
     tracing::info!("Database: Loading workspace index from {:?}", db_path);
 
     let conn = db::init_db(&db_path).map_err(|e| format!("Database init failed: {}", e))?;
+
+    // Load SIMD vector cache from database
+    match db::load_vector_cache(&conn) {
+        Ok(cache) => {
+            let cache_len = cache.len();
+            *state.vector_cache.lock().unwrap() = cache;
+            tracing::info!(
+                "Database: Loaded {} vectors into SIMD search cache.",
+                cache_len
+            );
+        }
+        Err(e) => {
+            tracing::error!("Database: Failed to load vector search cache: {}", e);
+        }
+    }
 
     *state.db_conn.lock().unwrap() = Some(conn);
     tracing::info!("Database: Loaded workspace sqlite-vec connection successfully.");
@@ -483,6 +501,27 @@ async fn index_workspace(
             error_count
         );
 
+        // Refresh in-memory SIMD search cache
+        let state_inner = app_handle_clone.state::<AppState>();
+        {
+            let db_lock = db_conn.lock().unwrap();
+            if let Some(conn) = db_lock.as_ref() {
+                match db::load_vector_cache(conn) {
+                    Ok(cache) => {
+                        let cache_len = cache.len();
+                        *state_inner.vector_cache.lock().unwrap() = cache;
+                        tracing::info!(
+                            "Database: Refreshed SIMD search cache with {} vectors.",
+                            cache_len
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Database: Failed to refresh SIMD search cache: {}", e);
+                    }
+                }
+            }
+        }
+
         // Notify UI that vector indices are ready
         let _ = app_handle_clone.emit("vector-index-updated", ());
     });
@@ -549,13 +588,16 @@ async fn search_symbols(
     .await
     .map_err(|e| format!("Embedding generation failed: {}", e))?;
 
-    let db_lock = state.db_conn.lock().unwrap();
-    let conn = db_lock
-        .as_ref()
-        .ok_or_else(|| "Database connection not initialized".to_string())?;
+    let results = {
+        let cache_lock = state.vector_cache.lock().unwrap();
+        let db_lock = state.db_conn.lock().unwrap();
+        let conn = db_lock
+            .as_ref()
+            .ok_or_else(|| "Database connection not initialized".to_string())?;
 
-    let results = db::search_symbols(conn, &embedding, threshold, limit)
-        .map_err(|e| format!("Database query failed: {}", e))?;
+        db::search_symbols_simd(conn, &cache_lock, &embedding, threshold, limit)
+            .map_err(|e| format!("Database query failed: {}", e))?
+    };
 
     Ok(results)
 }

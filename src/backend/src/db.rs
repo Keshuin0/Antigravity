@@ -90,6 +90,12 @@ pub struct SymbolToEmbed {
     pub content: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct VectorCacheEntry {
+    pub symbol_id: i64,
+    pub embedding: crate::simd::AlignedEmbedding,
+}
+
 pub fn f32_slice_to_u8_slice(slice: &[f32]) -> &[u8] {
     // Zero-Copy casting from f32 slice to u8 slice for binary BLOB binding
     slice.as_bytes()
@@ -208,6 +214,39 @@ pub fn save_embedding(conn: &Connection, symbol_id: i64, embedding: &[f32]) -> R
     Ok(())
 }
 
+pub fn load_vector_cache(conn: &Connection) -> Result<Vec<VectorCacheEntry>, String> {
+    let mut stmt = conn
+        .prepare("SELECT symbol_id, embedding FROM vec_symbols;")
+        .map_err(|e| format!("Failed to prepare select embeddings: {}", e))?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let symbol_id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((symbol_id, blob))
+        })
+        .map_err(|e| format!("Failed to query embeddings: {}", e))?;
+
+    let mut cache = Vec::new();
+    for r in rows {
+        let (symbol_id, blob) = r.map_err(|e| format!("Row mapping error: {}", e))?;
+
+        if blob.len() % 4 != 0 {
+            continue; // Invalid blob size
+        }
+        let f32_len = blob.len() / 4;
+        let f32_ptr = blob.as_ptr() as *const f32;
+        let f32_slice = unsafe { std::slice::from_raw_parts(f32_ptr, f32_len) };
+
+        cache.push(VectorCacheEntry {
+            symbol_id,
+            embedding: crate::simd::AlignedEmbedding::new(f32_slice),
+        });
+    }
+
+    Ok(cache)
+}
+
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct SearchResult {
     pub symbol_name: String,
@@ -259,6 +298,69 @@ pub fn search_symbols(
         let res = r?;
         if res.similarity >= threshold {
             results.push(res);
+        }
+    }
+
+    Ok(results)
+}
+
+pub fn search_symbols_simd(
+    conn: &Connection,
+    cache: &[VectorCacheEntry],
+    query_embedding: &[f32],
+    threshold: f32,
+    limit: i32,
+) -> Result<Vec<SearchResult>> {
+    if cache.is_empty() {
+        // Fallback to SQLite virtual table search directly if cache is not loaded yet
+        return search_symbols(conn, query_embedding, threshold, limit);
+    }
+
+    let query_aligned = crate::simd::AlignedEmbedding::new(query_embedding);
+
+    // 1. Compute L2 distance for all cached symbols using SIMD
+    let mut scored: Vec<(i64, f32)> = Vec::with_capacity(cache.len());
+    for (idx, entry) in cache.iter().enumerate() {
+        let next_entry = cache.get(idx + 1).map(|e| &e.embedding);
+        let dist = crate::simd::l2_distance(&query_aligned, &entry.embedding, next_entry);
+        let similarity = 1.0 - (dist / 2.0);
+        if similarity >= threshold {
+            scored.push((entry.symbol_id, similarity));
+        }
+    }
+
+    // 2. Sort by similarity descending
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 3. Take the top `limit` results
+    let top_n = scored.into_iter().take(limit as usize).collect::<Vec<_>>();
+
+    if top_n.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // 4. Retrieve metadata for the top N symbols (highly optimized primary-key joins)
+    let mut stmt = conn.prepare(
+        "SELECT s.name, s.kind, f.path, s.start_line, s.end_line
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.id = ?1;",
+    )?;
+
+    let mut results = Vec::new();
+    for (symbol_id, similarity) in top_n {
+        let res = stmt.query_row([symbol_id], |row| {
+            Ok(SearchResult {
+                symbol_name: row.get(0)?,
+                symbol_kind: row.get(1)?,
+                file_path: row.get(2)?,
+                start_line: row.get(3)?,
+                end_line: row.get(4)?,
+                similarity,
+            })
+        });
+        if let Ok(item) = res {
+            results.push(item);
         }
     }
 
@@ -333,8 +435,9 @@ mod tests {
 
         let mut query = vec![0.0f32; 768];
         query[0] = 1.0f32;
-        let results = search_symbols(&conn, &query, 0.5, 5).unwrap();
 
+        // Test standard SQLite MATCH search
+        let results = search_symbols(&conn, &query, 0.5, 5).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].symbol_name, "test");
         assert_eq!(results[0].symbol_kind, "function");
@@ -342,5 +445,20 @@ mod tests {
         assert_eq!(results[0].start_line, 1);
         assert_eq!(results[0].end_line, 3);
         assert!((results[0].similarity - 1.0).abs() < 1e-5);
+
+        // Test in-memory SIMD search cache loader
+        let cache = load_vector_cache(&conn).unwrap();
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache[0].symbol_id, sym_id);
+
+        // Test custom SIMD search router
+        let results_simd = search_symbols_simd(&conn, &cache, &query, 0.5, 5).unwrap();
+        assert_eq!(results_simd.len(), 1);
+        assert_eq!(results_simd[0].symbol_name, "test");
+        assert_eq!(results_simd[0].symbol_kind, "function");
+        assert_eq!(results_simd[0].file_path, "src/main.rs");
+        assert_eq!(results_simd[0].start_line, 1);
+        assert_eq!(results_simd[0].end_line, 3);
+        assert!((results_simd[0].similarity - 1.0).abs() < 1e-5);
     }
 }
