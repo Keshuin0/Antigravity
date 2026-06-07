@@ -1,70 +1,196 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500;600;700&display=swap');
+
 @import 'tailwindcss';
 
-@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Fira+Code:wght@400;500;600;700&display=swap');
+@theme {
+  --color-primary: rgb(var(--primary));
+  --color-accent: rgb(var(--accent));
+  --color-theme-bg: rgb(var(--bg-primary));
+  --color-theme-card: rgb(var(--bg-secondary));
+  --color-glow: var(--glow-color);
+}
 
 :root {
   font-family: 'Outfit', sans-serif;
   color-scheme: dark;
+  
+  /* Defaults to Obsidian Theme */
+  --primary: 139, 92, 246;    /* Violet-500 HSL/RGB */
+  --accent: 217, 70, 239;     /* Fuchsia-500 */
+  --glow-color: rgba(139, 92, 246, 0.45);
+  --bg-primary: 3, 5, 9;
+  --bg-secondary: 10, 14, 23;
+  --text-color: 243, 244, 246;
+}
+
+.theme-obsidian {
+  --primary: 139, 92, 246;
+  --accent: 217, 70, 239;
+  --glow-color: rgba(139, 92, 246, 0.45);
+  --bg-primary: 3, 5, 9;
+  --bg-secondary: 12, 17, 29;
+}
+
+.theme-emerald {
+  --primary: 16, 185, 129;    /* Emerald-500 */
+  --accent: 5, 150, 105;      /* Emerald-600 */
+  --glow-color: rgba(16, 185, 129, 0.45);
+  --bg-primary: 2, 8, 6;
+  --bg-secondary: 8, 20, 16;
+}
+
+.theme-cyberpunk {
+  --primary: 243, 201, 10;    /* Cyber Yellow */
+  --accent: 6, 182, 212;      /* Cyan-500 */
+  --glow-color: rgba(243, 201, 10, 0.45);
+  --bg-primary: 10, 10, 8;
+  --bg-secondary: 22, 22, 18;
+}
+
+.theme-antigravity {
+  --primary: 59, 130, 246;    /* Blue-500 */
+  --accent: 14, 165, 233;     /* Cyan-500 */
+  --glow-color: rgba(59, 130, 246, 0.45);
+  --bg-primary: 3, 7, 18;
+  --bg-secondary: 10, 18, 38;
 }
 
 body {
   margin: 0;
   padding: 0;
-  background-color: transparent; /* Let 3D canvas show through */
-  color: #f3f4f6;
+  background-color: rgb(var(--bg-primary));
+  color: var(--text-color);
   overflow: hidden;
+  transition: background-color 0.5s ease;
 }
 
-/* Glassmorphism utility classes */
+/* Glassmorphism custom components */
 .glass-panel {
-  background: rgba(10, 14, 23, 0.4);
-  backdrop-filter: blur(24px);
-  -webkit-backdrop-filter: blur(24px);
-  border: 1px solid rgba(255, 255, 255, 0.05);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  background: rgba(var(--bg-secondary), 0.4);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05), 0 8px 32px 0 rgba(0, 0, 0, 0.4);
 }
 
 .glass-card {
-  background: rgba(255, 255, 255, 0.02);
-  backdrop-filter: blur(16px);
-  -webkit-backdrop-filter: blur(16px);
-  border: 1px solid rgba(255, 255, 255, 0.04);
-  transition: all 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  background: rgba(255, 255, 255, 0.01);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.02);
+  transition: all 0.4s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .glass-card:hover {
-  background: rgba(255, 255, 255, 0.06);
-  border-color: rgba(167, 139, 250, 0.4);
-  box-shadow: 0 10px 40px -10px rgba(139, 92, 246, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  background: rgba(255, 255, 255, 0.03);
+  border-color: rgba(var(--primary), 0.3);
+  box-shadow: 
+    0 12px 40px -12px rgba(var(--primary), 0.2),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  transform: translateY(-2px);
 }
 
-/* Bento Box Containers */
-.bento-container {
-  padding: 1rem;
-  gap: 1rem;
+/* Glowing text and buttons */
+.text-glow {
+  text-shadow: 0 0 12px rgba(var(--primary), 0.4);
 }
-.bento-item {
-  border-radius: 1.25rem;
+
+.shadow-glow {
+  box-shadow: 0 0 20px 0 var(--glow-color);
+}
+
+.shadow-glow-hover:hover {
+  box-shadow: 0 0 25px 2px var(--glow-color);
+  border-color: rgba(var(--primary), 0.5);
+}
+
+/* Bento Box Grid helper */
+.bento-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 1.5rem;
+}
+
+/* Custom cyber scanline and overlay styling */
+.scanlines {
+  position: relative;
   overflow: hidden;
 }
 
-/* Custom glow elements */
-.glowing-core {
-  background: radial-gradient(circle, rgba(139, 92, 246, 0.2) 0%, rgba(139, 92, 246, 0) 70%);
+.scanlines::before {
+  content: " ";
+  display: block;
+  position: absolute;
+  top: 0; left: 0; bottom: 0; right: 0;
+  background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%), linear-gradient(90deg, rgba(255, 0, 0, 0.06), rgba(0, 255, 0, 0.02), rgba(0, 0, 255, 0.06));
+  z-index: 2;
+  background-size: 100% 4px, 6px 100%;
+  pointer-events: none;
+  opacity: 0.15;
 }
 
-/* Custom scrollbars */
+/* SVG Flow Path animation for Self-Healing flowchart */
+.flow-line {
+  stroke-dasharray: 8;
+  animation: dash 20s linear infinite;
+}
+
+@keyframes dash {
+  to {
+    stroke-dashoffset: -1000;
+  }
+}
+
+/* Floating dynamic gradient blobs */
+.glow-blob {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(140px);
+  opacity: 0.25;
+  mix-blend-mode: screen;
+  pointer-events: none;
+  animation: float 25s ease-in-out infinite alternate;
+  z-index: -5;
+}
+
+@keyframes float {
+  0% {
+    transform: translate(0px, 0px) scale(1);
+  }
+  50% {
+    transform: translate(120px, -80px) scale(1.3);
+  }
+  100% {
+    transform: translate(-100px, 100px) scale(0.9);
+  }
+}
+
+/* Custom Scrollbars */
 ::-webkit-scrollbar {
-  width: 4px;
-  height: 4px;
+  width: 5px;
+  height: 5px;
 }
+
 ::-webkit-scrollbar-track {
-  background: transparent;
+  background: rgba(0, 0, 0, 0.15);
 }
+
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.1);
-  border-radius: 4px;
+  background: rgba(var(--primary), 0.2);
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.03);
 }
+
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: rgba(var(--primary), 0.45);
+  box-shadow: 0 0 8px rgba(var(--primary), 0.4);
+}
+
+/* Monaco container gloss styling */
+.monaco-wrapper {
+  box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.6);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.03);
 }

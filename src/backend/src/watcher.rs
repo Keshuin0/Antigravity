@@ -17,7 +17,7 @@ pub fn clean_unc_path(path: &Path) -> PathBuf {
 
 pub struct WatcherHandle {
     _watcher: RecommendedWatcher,
-    pub debounce_abort: tokio::task::JoinHandle<()>,
+    pub debounce_abort: tauri::async_runtime::JoinHandle<()>,
 }
 
 #[derive(Clone, Serialize)]
@@ -72,7 +72,7 @@ pub fn start_watching(
     let handle_clone = app_handle.clone();
 
     // Async task to handle events and debounce them
-    let debounce_abort = tokio::spawn(async move {
+    let debounce_abort = tauri::async_runtime::spawn(async move {
         let mut pending_events: std::collections::HashMap<PathBuf, (Instant, EventKind)> =
             std::collections::HashMap::new();
         let debounce_duration = Duration::from_millis(500);
