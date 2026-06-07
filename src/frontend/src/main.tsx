@@ -482,6 +482,9 @@ const App: React.FC = () => {
         has_key: boolean;
       }>('get_config');
       setWorkspaceRoot(payload.workspace_root);
+      if (payload.workspace_root) {
+        setWatcherActive(true);
+      }
       setLlmProvider(payload.llm_provider);
       setLlmEndpoint(payload.llm_endpoint || 'http://localhost:8000/v1');
       setLlmModel(payload.llm_model || '');

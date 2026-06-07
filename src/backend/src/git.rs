@@ -9,7 +9,12 @@ pub struct GitFileStatus {
 
 /// Checks if a directory is a valid Git repository.
 pub fn is_git_repo(path: &str) -> bool {
-    Repository::open(path).is_ok()
+    Repository::discover(path).is_ok()
+}
+
+fn open_repo(path: &str) -> Result<Repository, String> {
+    Repository::discover(path)
+        .map_err(|e| format!("Failed to discover repository for path '{}': {}", path, e))
 }
 
 /// Initializes a new Git repository at the specified path.
@@ -21,7 +26,7 @@ pub fn git_init(path: &str) -> Result<(), String> {
 
 /// Retrieves the name of the current active branch.
 pub fn git_current_branch(path: &str) -> Result<String, String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     if repo.head_detached().unwrap_or(false) {
         return Ok("DETACHED".to_string());
     }
@@ -34,7 +39,7 @@ pub fn git_current_branch(path: &str) -> Result<String, String> {
 
 /// Gets the status of files in the workspace (staged, modified, untracked).
 pub fn git_status(path: &str) -> Result<Vec<GitFileStatus>, String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let mut opts = StatusOptions::new();
     opts.include_untracked(true).recurse_untracked_dirs(true);
 
@@ -77,7 +82,7 @@ pub fn git_status(path: &str) -> Result<Vec<GitFileStatus>, String> {
 
 /// Stages specific files in the index.
 pub fn git_stage_files(path: &str, files: Vec<String>) -> Result<(), String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
 
     for file in files {
@@ -94,7 +99,7 @@ pub fn git_stage_files(path: &str, files: Vec<String>) -> Result<(), String> {
 
 /// Unstages specific files in the index.
 pub fn git_unstage_files(path: &str, files: Vec<String>) -> Result<(), String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
 
     // Find HEAD commit target. If HEAD is unborn, we reset default to empty tree.
     let head_commit = match repo.head() {
@@ -111,7 +116,7 @@ pub fn git_unstage_files(path: &str, files: Vec<String>) -> Result<(), String> {
 
 /// Creates a new commit with staged changes and returns the commit hash.
 pub fn git_create_commit(path: &str, message: &str) -> Result<String, String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let mut index = repo.index().map_err(|e| e.to_string())?;
     let tree_id = index
         .write_tree()
@@ -144,7 +149,7 @@ pub fn git_create_commit(path: &str, message: &str) -> Result<String, String> {
 
 /// Creates a new branch from the current HEAD commit.
 pub fn git_create_branch(path: &str, name: &str) -> Result<(), String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let head_commit = repo
         .head()
         .and_then(|h| h.peel_to_commit())
@@ -157,7 +162,7 @@ pub fn git_create_branch(path: &str, name: &str) -> Result<(), String> {
 
 /// Safely switches checkout references to a specified branch.
 pub fn git_checkout_branch(path: &str, name: &str) -> Result<(), String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
 
     let obj = repo
         .revparse_single(&format!("refs/heads/{}", name))
@@ -177,7 +182,7 @@ pub fn git_checkout_branch(path: &str, name: &str) -> Result<(), String> {
 
 /// Reverts the working index and directory hard to a specific commit.
 pub fn git_rollback_to_commit(path: &str, commit_hash: &str) -> Result<(), String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let oid = git2::Oid::from_str(commit_hash)
         .map_err(|e| format!("Invalid commit hash format: {}", e))?;
     let target = repo
@@ -190,7 +195,7 @@ pub fn git_rollback_to_commit(path: &str, commit_hash: &str) -> Result<(), Strin
 
 /// Generates a unified diff of staged changes.
 pub fn git_diff_staged(path: &str) -> Result<String, String> {
-    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let repo = open_repo(path)?;
     let index = repo.index().map_err(|e| e.to_string())?;
 
     // Get HEAD tree. If HEAD does not exist, compare against an empty tree.
@@ -229,7 +234,7 @@ pub fn git_diff_staged(path: &str) -> Result<String, String> {
 
 /// Retrieves the content of a file as of the last HEAD commit.
 pub fn git_get_file_at_head(repo_path: &str, file_path: &str) -> Result<String, String> {
-    let repo = Repository::open(repo_path).map_err(|e| e.to_string())?;
+    let repo = open_repo(repo_path)?;
 
     let head = match repo.head() {
         Ok(h) => h,
