@@ -42,9 +42,7 @@ impl Default for AppState {
         let logs_buffer = std::sync::Arc::new(logger::TelemetryBuffer::new(1000));
         let default_ws = std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| {
-                "D:\\Softwares\\Installed\\Gemini\\antigravity\\scratch\\Antigravity".to_string()
-            });
+            .unwrap_or_else(|_| String::new());
         AppState {
             workspace_root: std::sync::Arc::new(Mutex::new(default_ws)),
             llm_provider: std::sync::Arc::new(Mutex::new("gemini".to_string())),

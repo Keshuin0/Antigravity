@@ -1,10 +1,13 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import { invoke, Channel } from '@tauri-apps/api/core';
-import { listen } from '@tauri-apps/api/event';
+import { listen, Event } from '@tauri-apps/api/event';
+import { Background3D } from './components/Background3D.tsx';
+import { motion, AnimatePresence } from 'framer-motion';
+import useSound from 'use-sound';
 import './index.css';
-import { FileExplorer } from './components/FileExplorer';
-import { MonacoEditor } from './components/MonacoEditor';
+import { FileExplorer } from './components/FileExplorer.tsx';
+import { MonacoEditor } from './components/MonacoEditor.tsx';
 
 interface LogEntry {
   id: string;
@@ -141,9 +144,14 @@ const App: React.FC = () => {
   const [geminiStatus, setGeminiStatus] = useState<'idle' | 'streaming' | 'success' | 'error'>(
     'idle'
   );
-  const [workspaceRoot, setWorkspaceRoot] = useState<string>(
-    'D:\\Softwares\\Installed\\Gemini\\antigravity\\scratch\\Antigravity'
-  );
+
+  // Sound Effects
+  const [playClick] = useSound('https://cdn.pixabay.com/download/audio/2022/03/15/audio_2d5218d8e1.mp3', { volume: 0.25 });
+  const [playHover] = useSound('https://cdn.pixabay.com/download/audio/2022/03/15/audio_c8b8f72c8e.mp3', { volume: 0.1 });
+  const [playSuccess] = useSound('https://cdn.pixabay.com/download/audio/2021/08/04/audio_0625c1539c.mp3', { volume: 0.3 });
+  const [playError] = useSound('https://cdn.pixabay.com/download/audio/2021/08/04/audio_c6ccf3232f.mp3', { volume: 0.3 });
+
+  const [workspaceRoot, setWorkspaceRoot] = useState<string>('');
   const [apiToken, setApiToken] = useState<string>('••••••••••••••••••••••••');
   const [llmProvider, setLlmProvider] = useState<string>('gemini');
   const [llmEndpoint, setLlmEndpoint] = useState<string>('http://localhost:8000/v1');
@@ -992,7 +1000,8 @@ const App: React.FC = () => {
   const hasUnsavedChanges = activeFilePath && activeFileContent !== originalFileContent;
 
   return (
-    <div className="flex flex-col w-screen h-screen overflow-hidden bg-[#07090e] text-white select-none">
+    <div className="flex flex-col w-screen h-screen overflow-hidden text-white select-none bg-transparent relative">
+      <Background3D />
       {/* 1. Header Navigation Bar */}
       <header className="h-14 flex items-center justify-between px-6 bg-[#0c0f16]/90 border-b border-white/5 backdrop-blur-md z-10 flex-shrink-0 select-none">
         <div className="flex items-center space-x-3">
@@ -1044,8 +1053,11 @@ const App: React.FC = () => {
       <div className="flex-1 flex overflow-hidden w-full relative">
         {/* Activity Toolbar (Left Icons) */}
         <div className="w-[50px] border-r border-white/5 bg-[#090d13]/85 flex flex-col items-center py-4 space-y-4 flex-shrink-0">
-          <button
-            onClick={() => setActiveSidebarTab('explorer')}
+          <motion.button
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            onMouseEnter={() => playHover()}
+            onClick={() => { playClick(); setActiveSidebarTab('explorer'); }}
             className={`p-2.5 rounded-lg transition-all duration-300 relative group ${
               activeSidebarTab === 'explorer'
                 ? 'text-cyan-400 bg-cyan-500/10'
@@ -1059,10 +1071,13 @@ const App: React.FC = () => {
             <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
               File Explorer
             </div>
-          </button>
+          </motion.button>
 
-          <button
-            onClick={() => setActiveSidebarTab('search')}
+          <motion.button
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            onMouseEnter={() => playHover()}
+            onClick={() => { playClick(); setActiveSidebarTab('search'); }}
             className={`p-2.5 rounded-lg transition-all duration-300 relative group ${
               activeSidebarTab === 'search'
                 ? 'text-cyan-400 bg-cyan-500/10'
@@ -1076,10 +1091,13 @@ const App: React.FC = () => {
             <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
               Semantic Search
             </div>
-          </button>
+          </motion.button>
 
-          <button
-            onClick={() => setActiveSidebarTab('git')}
+          <motion.button
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            onMouseEnter={() => playHover()}
+            onClick={() => { playClick(); setActiveSidebarTab('git'); }}
             className={`p-2.5 rounded-lg transition-all duration-300 relative group ${
               activeSidebarTab === 'git'
                 ? 'text-cyan-400 bg-cyan-500/10'
@@ -1093,10 +1111,13 @@ const App: React.FC = () => {
             <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
               Git Control
             </div>
-          </button>
+          </motion.button>
 
-          <button
-            onClick={() => setActiveSidebarTab('settings')}
+          <motion.button
+            whileHover={{ scale: 1.1 }}
+            whileTap={{ scale: 0.9 }}
+            onMouseEnter={() => playHover()}
+            onClick={() => { playClick(); setActiveSidebarTab('settings'); }}
             className={`p-2.5 rounded-lg transition-all duration-300 relative group ${
               activeSidebarTab === 'settings'
                 ? 'text-cyan-400 bg-cyan-500/10'
@@ -1110,7 +1131,7 @@ const App: React.FC = () => {
             <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
               IDE Settings
             </div>
-          </button>
+          </motion.button>
         </div>
 
         {/* Sidebar Expansion Pane */}
@@ -1818,38 +1839,57 @@ const App: React.FC = () => {
                 <div className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar bg-radial-gradient">
                   <div className="max-w-4xl mx-auto space-y-8">
                     {/* Welcome Telemetry Banner */}
-                    <div className="glass-panel p-8 rounded-2xl flex flex-col md:flex-row md:items-center justify-between relative overflow-hidden border border-white/5">
-                      <div className="absolute top-0 right-0 w-[300px] h-[300px] bg-cyan-500/5 rounded-full blur-[100px] pointer-events-none" />
-                      <div className="space-y-2 relative">
-                        <span className="px-2 py-0.5 rounded bg-cyan-500/10 text-cyan-400 border border-cyan-500/20 text-[9px] font-bold uppercase tracking-wider font-mono">
+                    <motion.div 
+                      initial={{ opacity: 0, y: 20 }}
+                      animate={{ opacity: 1, y: 0 }}
+                      transition={{ duration: 0.6, ease: "easeOut" }}
+                      className="glass-panel p-8 rounded-3xl flex flex-col md:flex-row md:items-center justify-between relative overflow-hidden bento-item"
+                    >
+                      <div className="absolute -top-20 -right-20 w-[400px] h-[400px] bg-accent-500/20 rounded-full blur-[120px] pointer-events-none" />
+                      <div className="absolute -bottom-20 -left-20 w-[300px] h-[300px] bg-primary-500/20 rounded-full blur-[100px] pointer-events-none" />
+                      <div className="space-y-3 relative z-10">
+                        <motion.span 
+                          initial={{ opacity: 0, scale: 0.8 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          transition={{ delay: 0.2, duration: 0.4 }}
+                          className="px-3 py-1 rounded-full bg-cyan-500/10 text-cyan-400 border border-cyan-500/30 text-[10px] font-bold uppercase tracking-widest font-mono"
+                        >
                           IDE Workspace Active
-                        </span>
-                        <h2 className="text-xl font-bold tracking-tight text-white">
+                        </motion.span>
+                        <h2 className="text-3xl font-extrabold tracking-tight text-white bg-clip-text text-transparent bg-gradient-to-r from-white to-white/60">
                           Double-compile Self-Healing Engine
                         </h2>
-                        <p className="text-xs text-white/50 max-w-md leading-relaxed">
+                        <p className="text-sm text-white/60 max-w-lg leading-relaxed">
                           Select any file in the Sidebar File Explorer to initialize Monaco
                           workspace compiler contexts. Write code and compile natively in real-time.
                         </p>
                       </div>
 
-                      <div className="mt-4 md:mt-0 flex space-x-3 flex-shrink-0">
-                        <button
-                          onClick={handleReindex}
+                      <div className="mt-6 md:mt-0 flex space-x-3 flex-shrink-0 relative z-10">
+                        <motion.button
+                          whileHover={{ scale: 1.05 }}
+                          whileTap={{ scale: 0.95 }}
+                          onMouseEnter={() => playHover()}
+                          onClick={() => { playClick(); handleReindex(); }}
                           disabled={isIndexing}
-                          className="px-5 py-2.5 bg-gradient-to-tr from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 text-white rounded-xl text-xs font-semibold active:scale-95 transition-all shadow-md shadow-cyan-500/20 cursor-pointer"
+                          className="px-6 py-3 bg-gradient-to-tr from-cyan-600 to-violet-600 hover:from-cyan-500 hover:to-violet-500 text-white rounded-2xl text-sm font-bold shadow-glow-cyan cursor-pointer transition-all disabled:opacity-50"
                         >
-                          {isIndexing ? 'Indexing...' : 'Index Workspace'}
-                        </button>
+                          {isIndexing ? 'Indexing Engine...' : 'Index Workspace'}
+                        </motion.button>
                       </div>
-                    </div>
+                    </motion.div>
 
                     {/* Flowchart Grid */}
-                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bento-container">
                       {/* Self healing flowchart */}
-                      <div className="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 className="text-sm font-semibold text-white">
-                          Compiler Self-Healing Flowchart
+                      <motion.div 
+                        initial={{ opacity: 0, x: -20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: 0.3, duration: 0.5 }}
+                        className="glass-card p-6 rounded-2xl space-y-4 bento-item"
+                      >
+                        <h3 className="text-sm font-semibold text-white tracking-widest uppercase">
+                          Compiler Flowchart
                         </h3>
 
                         <div className="flex items-center justify-between py-2 font-mono text-[10px]">
@@ -1939,13 +1979,18 @@ const App: React.FC = () => {
                             <span className="text-[10px] text-white">Auto Commit</span>
                           </div>
                         </div>
-                      </div>
+                      </motion.div>
 
                       {/* File watcher activity stream */}
-                      <div className="glass-panel p-6 rounded-xl space-y-4">
+                      <motion.div 
+                        initial={{ opacity: 0, x: 20 }}
+                        animate={{ opacity: 1, x: 0 }}
+                        transition={{ delay: 0.4, duration: 0.5 }}
+                        className="glass-card p-6 rounded-2xl space-y-4 bento-item"
+                      >
                         <div className="flex items-center justify-between">
-                          <h3 className="text-sm font-semibold text-white">
-                            VFS File Watcher Monitor
+                          <h3 className="text-sm font-semibold text-white tracking-widest uppercase">
+                            VFS Watcher Monitor
                           </h3>
                           <div className="flex items-center space-x-1.5">
                             <span
@@ -1977,14 +2022,19 @@ const App: React.FC = () => {
                             ))}
                           </div>
                         )}
-                      </div>
+                      </motion.div>
                     </div>
 
                     {/* Symbol list table */}
                     {symbolIndex.length > 0 && (
-                      <div className="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 className="text-sm font-semibold text-white">
-                          AST Code Symbol cache (sqlite-vec)
+                      <motion.div 
+                        initial={{ opacity: 0, y: 20 }}
+                        animate={{ opacity: 1, y: 0 }}
+                        transition={{ delay: 0.5, duration: 0.5 }}
+                        className="glass-card p-6 rounded-2xl space-y-4 bento-item mt-6"
+                      >
+                        <h3 className="text-sm font-semibold text-white tracking-widest uppercase">
+                          AST Symbol Cache
                         </h3>
                         <div className="max-h-[300px] overflow-y-auto custom-scrollbar border border-white/5 rounded-lg">
                           <table className="w-full text-left border-collapse text-[11px]">
@@ -2029,7 +2079,7 @@ const App: React.FC = () => {
                             </tbody>
                           </table>
                         </div>
-                      </div>
+                      </motion.div>
                     )}
                   </div>
                 </div>
