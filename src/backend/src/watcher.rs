@@ -290,6 +290,18 @@ async fn handle_debounced_changes(
                                         );
                                     }
                                 }
+
+                                // Refresh in-memory SIMD search cache
+                                let state_inner = app_handle_clone.state::<AppState>();
+                                if let Ok(cache) = crate::db::load_vector_cache(conn) {
+                                    let cache_len = cache.len();
+                                    *state_inner.vector_cache.lock().unwrap() = cache;
+                                    tracing::info!(
+                                        "Database: Refreshed SIMD search cache with {} vectors.",
+                                        cache_len
+                                    );
+                                }
+
                                 tracing::info!(
                                     "Watcher: Successfully auto-indexed and embedded {} symbols for '{}'",
                                     symbols_to_embed.len(),
@@ -337,6 +349,13 @@ async fn handle_debounced_changes(
                     [&path_str],
                 );
                 let _ = conn.execute("DELETE FROM files WHERE path = ?1;", [&path_str]);
+
+                // Refresh SIMD vector cache here too
+                if let Ok(cache) = crate::db::load_vector_cache(conn) {
+                    let cache_len = cache.len();
+                    *app_state.vector_cache.lock().unwrap() = cache;
+                    tracing::info!("Database: Refreshed SIMD search cache after deletion. Remaining: {} vectors.", cache_len);
+                }
             }
 
             tracing::info!("{}", log_msg);
