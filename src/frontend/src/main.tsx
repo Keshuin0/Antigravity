@@ -141,7 +141,9 @@ const App: React.FC = () => {
   const [geminiStatus, setGeminiStatus] = useState<'idle' | 'streaming' | 'success' | 'error'>(
     'idle'
   );
-  const [workspaceRoot, setWorkspaceRoot] = useState<string>('D:\\Project\\Antigravity SDK');
+  const [workspaceRoot, setWorkspaceRoot] = useState<string>(
+    'D:\\Softwares\\Installed\\Gemini\\antigravity\\scratch\\Antigravity'
+  );
   const [apiToken, setApiToken] = useState<string>('••••••••••••••••••••••••');
   const [llmProvider, setLlmProvider] = useState<string>('gemini');
   const [llmEndpoint, setLlmEndpoint] = useState<string>('http://localhost:8000/v1');
