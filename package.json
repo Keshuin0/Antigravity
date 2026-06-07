@@ -24,9 +24,9 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "tauri build"
+    "tauri": "cd src/backend && npx tauri",
+    "tauri:dev": "cd src/backend && npx tauri dev",
+    "tauri:build": "cd src/backend && npx tauri build"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.3.0",
