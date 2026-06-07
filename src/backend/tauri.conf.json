@@ -3,8 +3,8 @@
   "version": "0.1.0",
   "identifier": "com.antigravity.workspace",
   "build": {
-    "beforeBuildCommand": "npm run --prefix ../.. type-check",
-    "beforeDevCommand": "npm run --prefix ../.. dev",
+    "beforeBuildCommand": "npm run --prefix .. type-check",
+    "beforeDevCommand": "npm run --prefix .. dev",
     "devUrl": "http://localhost:5173",
     "frontendDist": "../frontend/dist"
   },
