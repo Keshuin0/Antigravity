@@ -1358,7 +1358,7 @@ async fn self_healing_loop(
     let max_depth = 3;
 
     let is_git = crate::git::is_git_repo(&workspace);
-    let original_branch = if is_git {
+    let mut original_branch = if is_git {
         crate::git::git_current_branch(&workspace).ok()
     } else {
         None
@@ -1366,11 +1366,35 @@ async fn self_healing_loop(
     let temp_branch = "antigravity-healing-temp";
 
     if is_git {
-        if let Ok(repo) = git2::Repository::open(&workspace) {
-            if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
-                if let Some(ref orig) = original_branch {
-                    let _ = crate::git::git_checkout_branch(&workspace, orig);
+        if let Ok(repo) = crate::git::open_repo(&workspace) {
+            let mut current_is_temp = false;
+            if let Some(ref orig) = original_branch {
+                if orig == temp_branch {
+                    current_is_temp = true;
                 }
+            }
+
+            if current_is_temp {
+                let mut fallback_branch = None;
+                if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+                    for b_res in branches {
+                        if let Ok((b, _)) = b_res {
+                            if let Ok(Some(name)) = b.name() {
+                                if name != temp_branch {
+                                    fallback_branch = Some(name.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref fallback) = fallback_branch {
+                    let _ = crate::git::git_checkout_branch(&workspace, fallback);
+                    original_branch = Some(fallback.clone());
+                }
+            }
+
+            if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
                 let _ = branch.delete();
             }
         }
