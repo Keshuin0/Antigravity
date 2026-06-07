@@ -4,114 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "windows")]
-mod win_job {
-    use std::os::raw::c_void;
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct JOBOBJECT_BASIC_LIMIT_INFORMATION {
-        active_process_limit: u32,
-        minimum_working_set_size: usize,
-        maximum_working_set_size: usize,
-        active_process_limit_flags: u32,
-        affinity: usize,
-        priority_class: u32,
-        scheduling_class: u32,
-    }
-
-    #[repr(C)]
-    #[allow(non_camel_case_types)]
-    struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-        basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION,
-        io_info: [u8; 48],
-        process_memory_limit: usize,
-        job_memory_limit: usize,
-        peak_process_memory_limit: usize,
-        peak_job_memory_limit: usize,
-    }
-
-    const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x00002000;
-    const JOB_OBJECT_INFO_CLASS_EXTENDED_LIMIT_INFORMATION: i32 = 9;
-
-    extern "system" {
-        fn CreateJobObjectW(lpJobAttributes: *mut c_void, lpName: *const u16) -> *mut c_void;
-        fn SetInformationJobObject(
-            hJob: *mut c_void,
-            JobObjectInformationClass: i32,
-            lpJobObjectInformation: *const c_void,
-            cbJobObjectInformationLength: u32,
-        ) -> i32;
-        fn AssignProcessToJobObject(hJob: *mut c_void, hProcess: *mut c_void) -> i32;
-        fn CloseHandle(hObject: *mut c_void) -> i32;
-    }
-
-    pub struct JobObject {
-        handle: *mut c_void,
-    }
-
-    unsafe impl Send for JobObject {}
-    unsafe impl Sync for JobObject {}
-
-    impl JobObject {
-        pub fn new() -> Result<Self, String> {
-            let handle = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
-            if handle.is_null() {
-                return Err("Failed to create Job Object".to_string());
-            }
-
-            let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION {
-                basic_limit_information: JOBOBJECT_BASIC_LIMIT_INFORMATION {
-                    active_process_limit: 0,
-                    minimum_working_set_size: 0,
-                    maximum_working_set_size: 0,
-                    active_process_limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-                    affinity: 0,
-                    priority_class: 0,
-                    scheduling_class: 0,
-                },
-                io_info: [0u8; 48],
-                process_memory_limit: 0,
-                job_memory_limit: 0,
-                peak_process_memory_limit: 0,
-                peak_job_memory_limit: 0,
-            };
-
-            let success = unsafe {
-                SetInformationJobObject(
-                    handle,
-                    JOB_OBJECT_INFO_CLASS_EXTENDED_LIMIT_INFORMATION,
-                    &mut info as *mut _ as *const c_void,
-                    std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                )
-            };
-
-            if success == 0 {
-                unsafe { CloseHandle(handle) };
-                return Err("Failed to set Job Object limits".to_string());
-            }
-
-            Ok(JobObject { handle })
-        }
-
-        pub fn assign_process(&self, process_handle: *mut c_void) -> Result<(), String> {
-            let success = unsafe { AssignProcessToJobObject(self.handle, process_handle) };
-            if success == 0 {
-                return Err("Failed to assign process to Job Object".to_string());
-            }
-            Ok(())
-        }
-    }
-
-    impl Drop for JobObject {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.handle);
-            }
-        }
-    }
-}
-
 fn which_binary(name: &str) -> Option<PathBuf> {
     if let Ok(path_env) = std::env::var("PATH") {
         for path in std::env::split_paths(&path_env) {
@@ -296,7 +188,7 @@ pub struct LspClient {
     open_files: Arc<Mutex<HashMap<String, String>>>,
     shutdown_tx: mpsc::Sender<()>,
     #[cfg(target_os = "windows")]
-    _job_object: Option<win_job::JobObject>,
+    _job_object: Option<crate::sandbox::JobObject>,
 }
 
 impl LspClient {
@@ -353,7 +245,7 @@ impl LspClient {
             .map_err(|e| format!("Failed to spawn language server process: {}", e))?;
 
         #[cfg(target_os = "windows")]
-        let job_object = match win_job::JobObject::new() {
+        let job_object = match crate::sandbox::JobObject::new() {
             Ok(job) => {
                 if let Some(raw_handle) = child.raw_handle() {
                     let _ = job.assign_process(raw_handle as *mut std::os::raw::c_void);

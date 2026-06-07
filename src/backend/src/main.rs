@@ -7,6 +7,7 @@ pub mod git;
 pub mod inference;
 pub mod lsp;
 pub mod parser;
+pub mod sandbox;
 pub mod security;
 pub mod watcher;
 
@@ -650,6 +651,8 @@ async fn run_process_and_stream(
     workspace_root: &str,
     tx: tokio::sync::mpsc::Sender<String>,
 ) -> Result<(i32, String), String> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
     use tokio::io::AsyncBufReadExt;
 
     let mut cmd = tokio::process::Command::new(program);
@@ -664,25 +667,61 @@ async fn run_process_and_stream(
         .spawn()
         .map_err(|e| format!("Failed to spawn process: {}", e))?;
 
+    // Create and configure Windows Job Object for the process group
+    #[cfg(target_os = "windows")]
+    let _job = match crate::sandbox::JobObject::new_with_limits(512 * 1024 * 1024, 32) {
+        Ok(job) => {
+            if let Some(raw_handle) = child.raw_handle() {
+                let _ = job.assign_process(raw_handle as *mut std::os::raw::c_void);
+            }
+            Some(job)
+        }
+        Err(e) => {
+            let _ = tx.send(format!(
+                "[Self-Healing Engine] Sandbox Warning: failed to configure process constraints: {}",
+                e
+            )).await;
+            None
+        }
+    };
+
     let stdout = child.stdout.take().ok_or("Failed to open stdout")?;
     let stderr = child.stderr.take().ok_or("Failed to open stderr")?;
 
-    let tx_out = tx.clone();
-    let tx_err = tx.clone();
+    let total_bytes = Arc::new(AtomicUsize::new(0));
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let output_limit = 5 * 1024 * 1024; // 5 MB
 
+    let tx_out = tx.clone();
+    let total_bytes_out = total_bytes.clone();
+    let limit_exceeded_out = limit_exceeded.clone();
     let stdout_handle = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
+            let line_len = line.len();
+            let prev = total_bytes_out.fetch_add(line_len, Ordering::SeqCst);
+            if prev + line_len > output_limit {
+                limit_exceeded_out.store(true, Ordering::SeqCst);
+                break;
+            }
             let _ = tx_out.send(line).await;
         }
     });
 
-    let stderr_accum = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let stderr_accum = Arc::new(Mutex::new(Vec::new()));
     let stderr_accum_clone = stderr_accum.clone();
-
+    let tx_err = tx.clone();
+    let total_bytes_err = total_bytes.clone();
+    let limit_exceeded_err = limit_exceeded.clone();
     let stderr_handle = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
+            let line_len = line.len();
+            let prev = total_bytes_err.fetch_add(line_len, Ordering::SeqCst);
+            if prev + line_len > output_limit {
+                limit_exceeded_err.store(true, Ordering::SeqCst);
+                break;
+            }
             {
                 let mut accum = stderr_accum_clone.lock().unwrap();
                 accum.push(line.clone());
@@ -691,24 +730,37 @@ async fn run_process_and_stream(
         }
     });
 
-    let status_fut = async {
-        let status = child
-            .wait()
-            .await
-            .map_err(|e| format!("Process execution failed: {}", e))?;
-        let _ = stdout_handle.await;
-        let _ = stderr_handle.await;
-        Ok::<_, String>(status)
-    };
+    let timeout_fut = tokio::time::sleep(std::time::Duration::from_secs(30));
+    tokio::pin!(timeout_fut);
 
-    let status = match tokio::time::timeout(std::time::Duration::from_secs(30), status_fut).await {
-        Ok(res) => res?,
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = tx.send("[Self-Healing Engine] Process execution timed out after 30 seconds. Process terminated.".to_string()).await;
-            return Err("Process execution timed out".to_string());
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(50));
+
+    let status = loop {
+        tokio::select! {
+            res = child.wait() => {
+                break res.map_err(|e| format!("Process execution failed: {}", e))?;
+            }
+            _ = &mut timeout_fut => {
+                let _ = child.kill().await;
+                let _ = tx.send("[Self-Healing Engine] Process execution timed out after 30 seconds. Process terminated.".to_string()).await;
+                return Err("Process execution timed out".to_string());
+            }
+            _ = interval.tick() => {
+                if limit_exceeded.load(Ordering::SeqCst) {
+                    let _ = child.kill().await;
+                    let _ = tx.send("[Self-Healing Engine] Sandbox Error: Terminated due to excessive output (> 5MB).".to_string()).await;
+                    return Err("Process terminated: output limit exceeded".to_string());
+                }
+            }
         }
     };
+
+    let _ = stdout_handle.await;
+    let _ = stderr_handle.await;
+
+    if limit_exceeded.load(Ordering::SeqCst) {
+        return Err("Process terminated: output limit exceeded".to_string());
+    }
 
     let exit_code = status.code().unwrap_or(-1);
     let full_stderr = {
@@ -2897,5 +2949,75 @@ mod tests {
 
         let invalid_code = "fn main() {\n    let x = ;\n}";
         assert!(!validate_patch_syntax(invalid_code, "rust"));
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_success() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let workspace = std::env::temp_dir();
+
+        let program = if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
+        let args = if cfg!(target_os = "windows") {
+            vec!["/c".to_string(), "echo success_test".to_string()]
+        } else {
+            vec!["-c".to_string(), "echo success_test".to_string()]
+        };
+
+        // Spawn a background task to receive logs so we don't block
+        let log_handle = tokio::spawn(async move {
+            let mut logs = Vec::new();
+            while let Some(msg) = rx.recv().await {
+                logs.push(msg);
+            }
+            logs
+        });
+
+        let res = run_process_and_stream(program, &args, &workspace.to_string_lossy(), tx).await;
+        assert!(res.is_ok());
+        let (exit_code, _stderr) = res.unwrap();
+        assert_eq!(exit_code, 0);
+
+        let logs = log_handle.await.unwrap();
+        assert!(logs.iter().any(|line| line.contains("success_test")));
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_output_limit() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let workspace = std::env::temp_dir();
+
+        let program = if cfg!(target_os = "windows") {
+            "cmd"
+        } else {
+            "sh"
+        };
+        let args = if cfg!(target_os = "windows") {
+            // Print a huge amount of text to hit the 5MB limit quickly
+            vec!["/c".to_string(), "for /L %i in (1,1,150000) do @echo runaway runaway runaway runaway runaway runaway runaway runaway runaway runaway".to_string()]
+        } else {
+            vec!["-c".to_string(), "yes runaway | head -n 500000".to_string()]
+        };
+
+        let log_handle = tokio::spawn(async move {
+            let mut logs = Vec::new();
+            while let Some(msg) = rx.recv().await {
+                logs.push(msg);
+            }
+            logs
+        });
+
+        let res = run_process_and_stream(program, &args, &workspace.to_string_lossy(), tx).await;
+        assert!(res.is_err());
+        let err_msg = res.err().unwrap();
+        assert!(err_msg.contains("output limit exceeded"));
+
+        let logs = log_handle.await.unwrap();
+        assert!(logs
+            .iter()
+            .any(|line| line.contains("Sandbox Error: Terminated due to excessive output")));
     }
 }
