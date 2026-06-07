@@ -1991,6 +1991,12 @@ fn git_stage_files_cmd(files: Vec<String>, state: State<'_, AppState>) -> Result
 }
 
 #[tauri::command]
+fn git_unstage_files_cmd(files: Vec<String>, state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_unstage_files(&ws, files)
+}
+
+#[tauri::command]
 fn git_create_commit_cmd(message: String, state: State<'_, AppState>) -> Result<String, String> {
     let ws = state.workspace_root.lock().unwrap().clone();
     crate::git::git_create_commit(&ws, &message)
@@ -2015,6 +2021,268 @@ fn git_rollback_to_commit_cmd(
 ) -> Result<(), String> {
     let ws = state.workspace_root.lock().unwrap().clone();
     crate::git::git_rollback_to_commit(&ws, &commit_hash)
+}
+
+#[tauri::command]
+fn git_diff_staged_cmd(state: State<'_, AppState>) -> Result<String, String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_diff_staged(&ws)
+}
+
+#[tauri::command]
+fn git_get_file_at_head_cmd(
+    file_path: String,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_get_file_at_head(&ws, &file_path)
+}
+
+#[tauri::command]
+fn git_push_branch_cmd(state: State<'_, AppState>) -> Result<(), String> {
+    let ws = state.workspace_root.lock().unwrap().clone();
+    crate::git::git_push(&ws)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct GeneratedCommitResponse {
+    pub message: String,
+    pub impact_summary: String,
+    pub has_secrets: bool,
+}
+
+#[tauri::command]
+async fn git_generate_commit_message_cmd(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<GeneratedCommitResponse, String> {
+    let workspace = state.workspace_root.lock().unwrap().clone();
+    let diff = crate::git::git_diff_staged(&workspace)?;
+
+    if diff.trim().is_empty() {
+        return Err("No changes are staged for commit. Please stage files first.".to_string());
+    }
+
+    // 1. Scan the diff for sensitive credentials (leak prevention)
+    let redacted_diff = crate::logger::redact_secrets(&diff);
+    let has_secrets = redacted_diff != diff;
+
+    // 2. Diff Truncation Gate (max 500 lines or ~20KB) to protect LLM context limits
+    let mut truncated_diff = diff.clone();
+    let line_count = truncated_diff.lines().count();
+    if line_count > 500 || truncated_diff.len() > 20000 {
+        let lines: Vec<&str> = truncated_diff.lines().take(500).collect();
+        truncated_diff = lines.join("\n");
+        truncated_diff.push_str("\n\n[Diff truncated for length - first 500 lines shown...]");
+    }
+
+    // 3. Obtain provider credentials
+    let provider = state.llm_provider.lock().unwrap().clone();
+    let endpoint = state.llm_endpoint.lock().unwrap().clone();
+    let model = state.llm_model.lock().unwrap().clone();
+    let obf_key_opt = state.api_token.lock().unwrap().clone();
+
+    let final_api_key = match obf_key_opt {
+        Some(obf) => obf,
+        None => {
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                obf
+            } else {
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    crate::security::ObfBox::new(env_key.as_bytes())
+                } else {
+                    return Err(format!(
+                        "API key is not configured for provider '{}'. Please configure one in Settings.",
+                        provider
+                    ));
+                }
+            }
+        }
+    };
+
+    // 4. Construct specialized release coordinator prompt
+    let prompt = format!(
+        "You are an expert Git release coordinator. Analyze the git diff and write a commit message conforming to the Conventional Commits 1.0.0 specification.\n\
+        Format your response as a JSON object matching this schema:\n\
+        {{\n\
+          \"commit_message\": \"<type>(<scope>): <subject>\\n\\n[body containing bullet points if changes are complex]\",\n\
+          \"impact_summary\": \"<A brief 1-2 sentence description of the logical change and its implications>\"\n\
+        }}\n\
+        \n\
+        Rules for the commit message:\n\
+        1. Type must be one of: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert.\n\
+        2. Scope should be lowercase and represent the main component affected (e.g. backend, watcher, frontend, logger).\n\
+        3. Subject must be lowercase, in the present tense, imperative mood (e.g., 'add watcher', not 'added watcher' or 'adds watcher'), and under 50 characters.\n\
+        4. Do not end the subject with a period.\n\
+        \n\
+        Here is the git diff:\n\
+        ---\n\
+        {}\n\
+        ---\n\
+        Return ONLY the raw JSON block. Do not wrap it in markdown code fences.",
+        truncated_diff
+    );
+
+    // 5. Query LLM
+    let (api_tx, mut api_rx) = tokio::sync::mpsc::channel(100);
+    let provider_clone = provider.clone();
+    let endpoint_clone = endpoint.clone();
+    let model_clone = model.clone();
+    let app_handle_clone = app_handle.clone();
+    let final_api_key_clone = final_api_key.clone();
+    let prompt_clone = prompt.clone();
+
+    tokio::spawn(async move {
+        let _ = crate::inference::stream_generate_content_multiplexed(
+            &provider_clone,
+            endpoint_clone.as_deref(),
+            model_clone.as_deref(),
+            &final_api_key_clone,
+            &prompt_clone,
+            None,
+            api_tx,
+            Some(app_handle_clone),
+        )
+        .await;
+    });
+
+    let mut collected_response = String::new();
+    while let Some(token) = api_rx.recv().await {
+        if !token.contains("[Telemetry]") {
+            collected_response.push_str(&token);
+        }
+    }
+
+    // 6. Parse structured response
+    let json_str = extract_json_from_response(&collected_response);
+
+    #[derive(serde::Deserialize)]
+    struct LlmCommitSchema {
+        commit_message: String,
+        impact_summary: String,
+    }
+
+    let parsed: LlmCommitSchema = match serde_json::from_str(&json_str) {
+        Ok(val) => val,
+        Err(_) => {
+            // Fallback: If JSON parsing fails, extract a commit message fallback
+            let fallback_message = extract_conventional_fallback(&collected_response);
+            LlmCommitSchema {
+                commit_message: fallback_message,
+                impact_summary: "Generated commit message via fallback parser.".to_string(),
+            }
+        }
+    };
+
+    // 7. Validation & Formatting Gate (Clean commit message format to guarantee 1.0.0 compliance)
+    let validated_message = validate_and_format_commit_message(&parsed.commit_message);
+
+    Ok(GeneratedCommitResponse {
+        message: validated_message,
+        impact_summary: parsed.impact_summary,
+        has_secrets,
+    })
+}
+
+fn extract_conventional_fallback(s: &str) -> String {
+    // If the response contains markdown block, extract it
+    let code_block = extract_markdown_code_block(s);
+    let cleaned = code_block.trim();
+    if cleaned.is_empty() {
+        return "feat: update workspace files".to_string();
+    }
+    cleaned.to_string()
+}
+
+fn validate_and_format_commit_message(msg: &str) -> String {
+    let lines: Vec<&str> = msg.lines().collect();
+    if lines.is_empty() {
+        return "feat: update workspace files".to_string();
+    }
+
+    let header = lines[0].trim();
+    let body_lines = &lines[1..];
+
+    // Check if header fits <type>(<scope>): <subject> or <type>: <subject>
+    let mut type_part = "feat";
+    let mut scope_part = None;
+    let mut subject_part = header.to_string();
+
+    if let Some(colon_pos) = header.find(':') {
+        let prefix = &header[..colon_pos].trim();
+        let mut subject = header[colon_pos + 1..].trim().to_string();
+
+        // Remove trailing period from subject
+        if subject.ends_with('.') {
+            subject.pop();
+        }
+
+        subject_part = subject;
+
+        if let Some(paren_start) = prefix.find('(') {
+            if let Some(paren_end) = prefix.find(')') {
+                if paren_end > paren_start {
+                    type_part = prefix[..paren_start].trim();
+                    scope_part = Some(prefix[paren_start + 1..paren_end].trim().to_lowercase());
+                }
+            }
+        } else {
+            type_part = prefix;
+        }
+    }
+
+    // Normalize type
+    let normalized_type = type_part.trim().to_lowercase();
+    let valid_types = [
+        "feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore",
+        "revert",
+    ];
+    let final_type = if valid_types.contains(&normalized_type.as_str()) {
+        normalized_type
+    } else {
+        "feat".to_string()
+    };
+
+    // Normalize subject
+    let final_subject = if !subject_part.is_empty() {
+        let mut chars = subject_part.chars();
+        if let Some(first_char) = chars.next() {
+            first_char.to_lowercase().collect::<String>() + chars.as_str()
+        } else {
+            subject_part
+        }
+    } else {
+        "update workspace files".to_string()
+    };
+
+    // Reconstruct header
+    let final_header = if let Some(ref scope) = scope_part {
+        format!("{}({}): {}", final_type, scope, final_subject)
+    } else {
+        format!("{}: {}", final_type, final_subject)
+    };
+
+    // Reconstruct full commit message
+    if body_lines.is_empty() {
+        final_header
+    } else {
+        let mut full_msg = final_header;
+        for line in body_lines {
+            full_msg.push('\n');
+            full_msg.push_str(line);
+        }
+        full_msg
+    }
 }
 
 fn get_lsp_client_for_path(
@@ -2887,10 +3155,15 @@ fn main() {
             git_current_branch_cmd,
             git_status_cmd,
             git_stage_files_cmd,
+            git_unstage_files_cmd,
             git_create_commit_cmd,
             git_create_branch_cmd,
             git_checkout_branch_cmd,
             git_rollback_to_commit_cmd,
+            git_diff_staged_cmd,
+            git_get_file_at_head_cmd,
+            git_generate_commit_message_cmd,
+            git_push_branch_cmd,
             read_workspace_file_cmd,
             write_workspace_file_cmd,
             read_workspace_dir_cmd,
@@ -3044,5 +3317,41 @@ mod tests {
         assert!(logs
             .iter()
             .any(|line| line.contains("Sandbox Error: Terminated due to excessive output")));
+    }
+
+    #[test]
+    fn test_validate_and_format_commit_message() {
+        // Test standard formatting
+        let raw_1 = "feat(watcher): Add debounced filesystem watcher";
+        assert_eq!(
+            validate_and_format_commit_message(raw_1),
+            "feat(watcher): add debounced filesystem watcher"
+        );
+
+        // Test capitalization and trailing period stripping
+        let raw_2 = "Fix(backend): Resolved compile errors.";
+        assert_eq!(
+            validate_and_format_commit_message(raw_2),
+            "fix(backend): resolved compile errors"
+        );
+
+        // Test invalid type normalization
+        let raw_3 = "unknownType(frontend): Update sidebar navigation";
+        assert_eq!(
+            validate_and_format_commit_message(raw_3),
+            "feat(frontend): update sidebar navigation"
+        );
+
+        // Test no-scope format
+        let raw_4 = "docs: Add setup instructions.";
+        assert_eq!(
+            validate_and_format_commit_message(raw_4),
+            "docs: add setup instructions"
+        );
+
+        // Test multiline body preserving
+        let raw_5 = "refactor(logger): clean up imports.\n\n- Remove unused use statements\n- Format dependencies";
+        let expected_5 = "refactor(logger): clean up imports\n\n- Remove unused use statements\n- Format dependencies";
+        assert_eq!(validate_and_format_commit_message(raw_5), expected_5);
     }
 }

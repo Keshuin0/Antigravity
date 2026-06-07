@@ -92,6 +92,23 @@ pub fn git_stage_files(path: &str, files: Vec<String>) -> Result<(), String> {
         .map_err(|e| format!("Failed to write index: {}", e))
 }
 
+/// Unstages specific files in the index.
+pub fn git_unstage_files(path: &str, files: Vec<String>) -> Result<(), String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+
+    // Find HEAD commit target. If HEAD is unborn, we reset default to empty tree.
+    let head_commit = match repo.head() {
+        Ok(head) => {
+            let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+            Some(commit.into_object())
+        }
+        Err(_) => None,
+    };
+
+    repo.reset_default(head_commit.as_ref(), files.iter().map(Path::new))
+        .map_err(|e| format!("Failed to unstage files: {}", e))
+}
+
 /// Creates a new commit with staged changes and returns the commit hash.
 pub fn git_create_commit(path: &str, message: &str) -> Result<String, String> {
     let repo = Repository::open(path).map_err(|e| e.to_string())?;
@@ -169,6 +186,138 @@ pub fn git_rollback_to_commit(path: &str, commit_hash: &str) -> Result<(), Strin
 
     repo.reset(target.as_object(), ResetType::Hard, None)
         .map_err(|e| format!("Failed hard reset rollback: {}", e))
+}
+
+/// Generates a unified diff of staged changes.
+pub fn git_diff_staged(path: &str) -> Result<String, String> {
+    let repo = Repository::open(path).map_err(|e| e.to_string())?;
+    let index = repo.index().map_err(|e| e.to_string())?;
+
+    // Get HEAD tree. If HEAD does not exist, compare against an empty tree.
+    let head_tree = match repo.head() {
+        Ok(head) => {
+            let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+            Some(commit.tree().map_err(|e| e.to_string())?)
+        }
+        Err(_) => None,
+    };
+
+    let mut diff_opts = git2::DiffOptions::new();
+    let diff = repo
+        .diff_tree_to_index(head_tree.as_ref(), Some(&index), Some(&mut diff_opts))
+        .map_err(|e| e.to_string())?;
+
+    let mut diff_str = String::new();
+    diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+        if let Ok(s) = std::str::from_utf8(line.content()) {
+            match line.origin() {
+                '+' | '-' | ' ' => {
+                    diff_str.push(line.origin());
+                    diff_str.push_str(s);
+                }
+                _ => {
+                    diff_str.push_str(s);
+                }
+            }
+        }
+        true
+    })
+    .map_err(|e| e.to_string())?;
+
+    Ok(diff_str)
+}
+
+/// Retrieves the content of a file as of the last HEAD commit.
+pub fn git_get_file_at_head(repo_path: &str, file_path: &str) -> Result<String, String> {
+    let repo = Repository::open(repo_path).map_err(|e| e.to_string())?;
+
+    let head = match repo.head() {
+        Ok(h) => h,
+        Err(_) => return Ok(String::new()), // Empty if no commits yet
+    };
+
+    let commit = head.peel_to_commit().map_err(|e| e.to_string())?;
+    let tree = commit.tree().map_err(|e| e.to_string())?;
+
+    // Normalize path separators to forward slashes for git2
+    let normalized_path = file_path.replace('\\', "/");
+
+    let entry = match tree.get_path(Path::new(&normalized_path)) {
+        Ok(entry) => entry,
+        Err(_) => return Ok(String::new()), // File not found in HEAD
+    };
+
+    let object = entry.to_object(&repo).map_err(|e| e.to_string())?;
+    let blob = object.as_blob().ok_or("Object is not a blob")?;
+
+    let content = std::str::from_utf8(blob.content())
+        .map_err(|e| format!("Failed to read blob as UTF-8 string: {}", e))?;
+
+    Ok(content.to_string())
+}
+
+fn get_git_executable() -> String {
+    // 1. Check if git is available on PATH
+    if std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return "git".to_string();
+    }
+
+    // 2. Check standard GitHub Desktop paths on D: drive
+    if let Ok(entries) = std::fs::read_dir("D:\\Softwares\\Installed\\GitHubDesktop") {
+        let mut app_dirs: Vec<std::path::PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("")
+                        .starts_with("app-")
+            })
+            .collect();
+        // Sort to get the latest app version
+        app_dirs.sort();
+        if let Some(latest_app) = app_dirs.last() {
+            let cmd_path = latest_app.join("resources\\app\\git\\cmd\\git.exe");
+            if cmd_path.exists() {
+                return cmd_path.to_string_lossy().to_string();
+            }
+            let bin_path = latest_app.join("resources\\app\\git\\mingw64\\bin\\git.exe");
+            if bin_path.exists() {
+                return bin_path.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    // Fallback to "git"
+    "git".to_string()
+}
+
+/// Synchronizes (pushes) the active branch to the remote branch of 'origin'.
+pub fn git_push(path: &str) -> Result<(), String> {
+    let branch = git_current_branch(path)?;
+    if branch == "DETACHED" {
+        return Err("Cannot push in detached HEAD state".to_string());
+    }
+
+    // Run system command `git push origin <branch>` synchronously
+    let git_exe = get_git_executable();
+    let output = std::process::Command::new(git_exe)
+        .args(["push", "origin", &branch])
+        .current_dir(path)
+        .output()
+        .map_err(|e| format!("Failed to execute git push: {}", e))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        Err(format!("Git push failed: {}", stderr.trim()))
+    }
 }
 
 #[cfg(test)]
@@ -257,6 +406,59 @@ mod tests {
         // 10. Switch back to master and verify
         assert!(git_checkout_branch(temp_dir_str, &current_branch).is_ok());
         assert_eq!(git_current_branch(temp_dir_str).unwrap(), current_branch);
+
+        // Cleanup
+        let _ = remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_git_diff_and_head_retrieval() {
+        let temp_dir = get_temp_git_dir();
+        let temp_dir_str = temp_dir.to_str().unwrap();
+
+        // Initialize repo
+        git_init(temp_dir_str).unwrap();
+
+        // 1. Check diff on unborn branch before anything staged
+        let empty_diff = git_diff_staged(temp_dir_str).unwrap();
+        assert!(empty_diff.is_empty());
+
+        // 2. Stage a file
+        let file_path = temp_dir.join("test_file.txt");
+        {
+            let mut file = File::create(&file_path).unwrap();
+            writeln!(file, "Hello, Git Diff!").unwrap();
+        }
+        git_stage_files(temp_dir_str, vec!["test_file.txt".to_string()]).unwrap();
+
+        // 3. Diff should show the added file contents since HEAD is unborn
+        let staged_diff = git_diff_staged(temp_dir_str).unwrap();
+        assert!(staged_diff.contains("+Hello, Git Diff!"));
+
+        // 4. Check file at head (should be empty since it is not committed yet)
+        let head_content = git_get_file_at_head(temp_dir_str, "test_file.txt").unwrap();
+        assert!(head_content.is_empty());
+
+        // 5. Commit it
+        git_create_commit(temp_dir_str, "commit for diff test").unwrap();
+
+        // 6. Check file at head (should contain the committed content)
+        let committed_head_content = git_get_file_at_head(temp_dir_str, "test_file.txt").unwrap();
+        assert_eq!(
+            committed_head_content.replace("\r\n", "\n"),
+            "Hello, Git Diff!\n"
+        );
+
+        // 7. Modify it
+        {
+            let mut file = File::create(&file_path).unwrap();
+            writeln!(file, "Hello, Git Diff!\nModified line.").unwrap();
+        }
+        git_stage_files(temp_dir_str, vec!["test_file.txt".to_string()]).unwrap();
+
+        // 8. Diff should show the changes relative to HEAD
+        let diff_after_mod = git_diff_staged(temp_dir_str).unwrap();
+        assert!(diff_after_mod.contains("+Modified line."));
 
         // Cleanup
         let _ = remove_dir_all(&temp_dir);

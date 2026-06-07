@@ -125,7 +125,7 @@ const parseAnsi = (text: string): React.ReactNode => {
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
-type SidebarTab = 'explorer' | 'search' | 'settings';
+type SidebarTab = 'explorer' | 'search' | 'settings' | 'git';
 type ConsoleTab = 'healer' | 'logs';
 
 const App: React.FC = () => {
@@ -155,8 +155,10 @@ const App: React.FC = () => {
   const [fileChanges, setFileChanges] = useState<FileChangeEvent[]>([]);
   const [symbolIndex, setSymbolIndex] = useState<FileSymbols[]>([]);
   const [watcherActive, setWatcherActive] = useState(false);
-  const [attachedFiles, setAttachedFiles] = useState<{ name: string; path: string; mimeType: string; size: number }[]>([]);
-  
+  const [attachedFiles, setAttachedFiles] = useState<
+    { name: string; path: string; mimeType: string; size: number }[]
+  >([]);
+
   // Semantic Search States
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [similarityThreshold, setSimilarityThreshold] = useState<number>(0.5);
@@ -172,6 +174,177 @@ const App: React.FC = () => {
   const [openTabs, setOpenTabs] = useState<string[]>([]);
   const [diagnostics, setDiagnostics] = useState<Record<string, LspDiagnostic[]>>({});
 
+  // Git Integration States
+  const [gitBranch, setGitBranch] = useState<string>('');
+  const [gitStatuses, setGitStatuses] = useState<{ path: string; status: string }[]>([]);
+  const [diffMode, setDiffMode] = useState<boolean>(false);
+  const [diffOriginalContent, setDiffOriginalContent] = useState<string>('');
+  const [commitMessage, setCommitMessage] = useState<string>('');
+  const [impactSummary, setImpactSummary] = useState<string>('');
+  const [hasSecretsInStaged, setHasSecretsInStaged] = useState<boolean>(false);
+  const [isGeneratingCommit, setIsGeneratingCommit] = useState<boolean>(false);
+  const [isPushing, setIsPushing] = useState<boolean>(false);
+
+  const loadGitStatus = useCallback(async () => {
+    if (!isTauri) return;
+    try {
+      const branchName = await invoke<string>('git_current_branch_cmd');
+      setGitBranch(branchName);
+      const statuses = await invoke<{ path: string; status: string }[]>('git_status_cmd');
+      setGitStatuses(statuses);
+    } catch (e) {
+      console.error('Failed to load Git status:', e);
+    }
+  }, []);
+
+  const handleStageFile = async (filePath: string) => {
+    if (!isTauri) return;
+    try {
+      await invoke('git_stage_files_cmd', { files: [filePath] });
+      addLog('success', `Git: Staged ${filePath}`);
+      loadGitStatus();
+    } catch (err) {
+      addLog('error', `Git FFI Error: Failed to stage file: ${err}`);
+    }
+  };
+
+  const handleUnstageFile = async (filePath: string) => {
+    if (!isTauri) return;
+    try {
+      await invoke('git_unstage_files_cmd', { files: [filePath] });
+      addLog('success', `Git: Unstaged ${filePath}`);
+      loadGitStatus();
+    } catch (err) {
+      addLog('error', `Git FFI Error: Failed to unstage file: ${err}`);
+    }
+  };
+
+  const handleStageAll = async () => {
+    if (!isTauri) return;
+    try {
+      const unstaged = gitStatuses
+        .filter((f) => f.status === 'Modified' || f.status === 'Untracked')
+        .map((f) => f.path);
+      if (unstaged.length > 0) {
+        await invoke('git_stage_files_cmd', { files: unstaged });
+        addLog('success', `Git: Staged all changes (${unstaged.length} files)`);
+        loadGitStatus();
+      }
+    } catch (err) {
+      addLog('error', `Git FFI Error: Failed to stage all: ${err}`);
+    }
+  };
+
+  const handleUnstageAll = async () => {
+    if (!isTauri) return;
+    try {
+      const staged = gitStatuses.filter((f) => f.status === 'Staged').map((f) => f.path);
+      if (staged.length > 0) {
+        await invoke('git_unstage_files_cmd', { files: staged });
+        addLog('success', `Git: Unstaged all changes (${staged.length} files)`);
+        loadGitStatus();
+      }
+    } catch (err) {
+      addLog('error', `Git FFI Error: Failed to unstage all: ${err}`);
+    }
+  };
+
+  const handleOpenDiff = async (gitFile: { path: string; status: string }) => {
+    if (!isTauri) return;
+    try {
+      const original = await invoke<string>('git_get_file_at_head_cmd', { filePath: gitFile.path });
+      const rawPath = workspaceRoot + '/' + gitFile.path;
+      const absPath = rawPath.replace(/\\/g, '/').replace(/\/+/g, '/');
+
+      let current = '';
+      if (gitFile.status !== 'Deleted') {
+        try {
+          current = await invoke<string>('read_workspace_file_cmd', { path: absPath });
+        } catch (_) {
+          // File might not exist or is deleted
+        }
+      }
+
+      setDiffMode(true);
+      setDiffOriginalContent(original);
+      setActiveFilePath(absPath);
+      setActiveFileContent(current);
+      setOriginalFileContent(original);
+
+      setOpenTabs((prev) => {
+        if (!prev.includes(absPath)) {
+          return [...prev, absPath];
+        }
+        return prev;
+      });
+
+      addLog('watcher', `Git: Loaded side-by-side staged diff for ${gitFile.path}`);
+    } catch (err) {
+      addLog('error', `Git FFI Error: Failed to open diff: ${err}`);
+    }
+  };
+
+  const handleGenerateCommit = async () => {
+    setIsGeneratingCommit(true);
+    setHasSecretsInStaged(false);
+    addLog(
+      'info',
+      'AI release coordinator analyzing diff and generating conventional commit message...'
+    );
+
+    try {
+      const res = await invoke<{ message: string; impact_summary: string; has_secrets: boolean }>(
+        'git_generate_commit_message_cmd'
+      );
+      setCommitMessage(res.message);
+      setImpactSummary(res.impact_summary);
+      setHasSecretsInStaged(res.has_secrets);
+
+      if (res.has_secrets) {
+        addLog(
+          'warn',
+          '⚠️ SECURITY WARNING: Sensitive credentials detected in the staged diff! Proceed with caution.'
+        );
+      } else {
+        addLog('success', 'Conventional commit message generated successfully.');
+      }
+    } catch (err) {
+      addLog('error', `AI Generation Failed: ${err}`);
+    } finally {
+      setIsGeneratingCommit(false);
+    }
+  };
+
+  const handleCommit = async () => {
+    if (!commitMessage.trim()) return;
+    try {
+      const hash = await invoke<string>('git_create_commit_cmd', { message: commitMessage });
+      addLog(
+        'success',
+        `Git: Created commit ${hash.substring(0, 7)}: "${commitMessage.split('\n')[0]}"`
+      );
+      setCommitMessage('');
+      setImpactSummary('');
+      setHasSecretsInStaged(false);
+      loadGitStatus();
+      setDiffMode(false);
+    } catch (err) {
+      addLog('error', `Git FFI Error: Commit execution failed: ${err}`);
+    }
+  };
+
+  const handlePush = async () => {
+    setIsPushing(true);
+    addLog('info', `Git Sync: Pushing active branch '${gitBranch}' to origin remote...`);
+    try {
+      await invoke('git_push_branch_cmd');
+      addLog('success', `Git Sync: Successfully pushed commits to remote repository.`);
+    } catch (err) {
+      addLog('error', `Git Sync Error: Push failed: ${err}`);
+    } finally {
+      setIsPushing(false);
+    }
+  };
 
   // Ref locks
   const logEndRef = useRef<HTMLDivElement>(null);
@@ -187,12 +360,42 @@ const App: React.FC = () => {
   const loadBackendLogs = useCallback(async () => {
     if (!isTauri) {
       setLogs([
-        { id: '1', time: '16:12:02', type: 'info', message: 'Antigravity workspace kernel booting (Browser Mock)...' },
-        { id: '2', time: '16:12:03', type: 'success', message: 'Tauri v2 IPC communication channel established.' },
-        { id: '3', time: '16:12:03', type: 'info', message: 'Windows ReadDirectoryChangesW watcher hooked to workspace root.' },
-        { id: '4', time: '16:12:04', type: 'success', message: 'sqlite-vec v0.1.9 database loaded with 768-dimension configuration.' },
-        { id: '5', time: '16:12:04', type: 'info', message: 'Tree-sitter scanning active. Found 42 source files.' },
-        { id: '6', time: '16:12:05', type: 'success', message: 'Workspace index populated (287 nodes, 72 functions, 14 structs).' },
+        {
+          id: '1',
+          time: '16:12:02',
+          type: 'info',
+          message: 'Antigravity workspace kernel booting (Browser Mock)...',
+        },
+        {
+          id: '2',
+          time: '16:12:03',
+          type: 'success',
+          message: 'Tauri v2 IPC communication channel established.',
+        },
+        {
+          id: '3',
+          time: '16:12:03',
+          type: 'info',
+          message: 'Windows ReadDirectoryChangesW watcher hooked to workspace root.',
+        },
+        {
+          id: '4',
+          time: '16:12:04',
+          type: 'success',
+          message: 'sqlite-vec v0.1.9 database loaded with 768-dimension configuration.',
+        },
+        {
+          id: '5',
+          time: '16:12:04',
+          type: 'info',
+          message: 'Tree-sitter scanning active. Found 42 source files.',
+        },
+        {
+          id: '6',
+          time: '16:12:05',
+          type: 'success',
+          message: 'Workspace index populated (287 nodes, 72 functions, 14 structs).',
+        },
       ]);
       setKernelStatus('active');
       return;
@@ -277,7 +480,6 @@ const App: React.FC = () => {
     }
   }, [workspaceRoot, startLspServers]);
 
-
   // Fetch symbol tree
   const loadSymbols = useCallback(async () => {
     if (!isTauri) return;
@@ -301,7 +503,8 @@ const App: React.FC = () => {
     loadBackendLogs();
     loadConfig();
     loadSymbols();
-  }, [loadBackendLogs, loadConfig, loadSymbols]);
+    loadGitStatus();
+  }, [loadBackendLogs, loadConfig, loadSymbols, loadGitStatus]);
 
   // IPC Event Listeners
   useEffect(() => {
@@ -330,6 +533,7 @@ const App: React.FC = () => {
           `Watcher: Detected [${event.payload.kind.toUpperCase()}] on ${event.payload.path.split('\\').pop()}`
         );
         loadSymbols();
+        loadGitStatus();
       });
 
       unlistenLogs = await listen<string>('kernel-log', (event) => {
@@ -348,12 +552,15 @@ const App: React.FC = () => {
         loadSymbols();
       });
 
-      unlistenLsp = await listen<{ uri: string; diagnostics: LspDiagnostic[] }>('lsp-diagnostics', (event) => {
-        setDiagnostics((prev) => ({
-          ...prev,
-          [event.payload.uri]: event.payload.diagnostics,
-        }));
-      });
+      unlistenLsp = await listen<{ uri: string; diagnostics: LspDiagnostic[] }>(
+        'lsp-diagnostics',
+        (event) => {
+          setDiagnostics((prev) => ({
+            ...prev,
+            [event.payload.uri]: event.payload.diagnostics,
+          }));
+        }
+      );
 
       unlistenTtft = await listen<number>('llm-ttft', (event) => {
         setLiveTtft(event.payload);
@@ -374,10 +581,11 @@ const App: React.FC = () => {
       if (unlistenTtft) unlistenTtft();
       if (unlistenTps) unlistenTps();
     };
-  }, [loadSymbols]);
+  }, [loadSymbols, loadGitStatus]);
 
   // File loading FFI
   const handleOpenFile = async (filePath: string) => {
+    setDiffMode(false);
     try {
       const content = await invoke<string>('read_workspace_file_cmd', { path: filePath });
       setOpenTabs((prev) => {
@@ -389,12 +597,20 @@ const App: React.FC = () => {
       setActiveFilePath(filePath);
       setActiveFileContent(content);
       setOriginalFileContent(content);
-      addLog('watcher', `VFS: Loaded code buffer for ${filePath.split('\\').pop() || filePath.split('/').pop()}`);
+      addLog(
+        'watcher',
+        `VFS: Loaded code buffer for ${filePath.split('\\').pop() || filePath.split('/').pop()}`
+      );
 
       // LSP notification didOpen
       if (isTauri) {
         const ext = filePath.split('.').pop()?.toLowerCase();
-        const lang = ext === 'rs' ? 'rust' : (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') ? 'typescript' : null;
+        const lang =
+          ext === 'rs'
+            ? 'rust'
+            : ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx'
+              ? 'typescript'
+              : null;
         if (lang) {
           invoke('lsp_file_open', { language: lang, path: filePath, content }).catch((err) => {
             console.warn('LSP file open failed:', err);
@@ -410,25 +626,40 @@ const App: React.FC = () => {
   const handleSaveActiveFile = async () => {
     if (!activeFilePath) return;
     try {
-      await invoke('write_workspace_file_cmd', { path: activeFilePath, content: activeFileContent });
+      await invoke('write_workspace_file_cmd', {
+        path: activeFilePath,
+        content: activeFileContent,
+      });
       setOriginalFileContent(activeFileContent);
-      addLog('success', `VFS: Saved modifications to disk for ${activeFilePath.split('\\').pop() || activeFilePath.split('/').pop()}`);
+      addLog(
+        'success',
+        `VFS: Saved modifications to disk for ${activeFilePath.split('\\').pop() || activeFilePath.split('/').pop()}`
+      );
 
       // LSP notification didSave
       if (isTauri) {
         const ext = activeFilePath.split('.').pop()?.toLowerCase();
-        const lang = ext === 'rs' ? 'rust' : (ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx') ? 'typescript' : null;
+        const lang =
+          ext === 'rs'
+            ? 'rust'
+            : ext === 'ts' || ext === 'tsx' || ext === 'js' || ext === 'jsx'
+              ? 'typescript'
+              : null;
         if (lang) {
-          invoke('lsp_file_save', { language: lang, path: activeFilePath, content: activeFileContent }).catch((err) => {
+          invoke('lsp_file_save', {
+            language: lang,
+            path: activeFilePath,
+            content: activeFileContent,
+          }).catch((err) => {
             console.warn('LSP file save failed:', err);
           });
         }
       }
+      loadGitStatus();
     } catch (err) {
       addLog('error', `VFS Error: Failed to save file changes: ${err}`);
     }
   };
-
 
   // Close tab handler
   const handleCloseTab = (filePath: string, e: React.MouseEvent) => {
@@ -459,13 +690,16 @@ const App: React.FC = () => {
 
     setGeminiStatus('streaming');
     isStreamingGeminiRef.current = true;
-    
+
     // Clear console logs of previous build attempts
     addLog('info', `Self-Healing: Spawning recursive builder for [${commandInput}]...`);
 
     if (!isTauri) {
       setTimeout(() => {
-        addLog('success', 'Self-Healing Loop (Browser Mock) successfully compiled after 1 healing iteration.');
+        addLog(
+          'success',
+          'Self-Healing Loop (Browser Mock) successfully compiled after 1 healing iteration.'
+        );
         setGeminiStatus('success');
         isStreamingGeminiRef.current = false;
       }, 2000);
@@ -475,9 +709,12 @@ const App: React.FC = () => {
     // Process attachments: large files (>2MB) on Gemini are uploaded via Files API
     const backendAttachments: { mime_type: string; data: string; path: string }[] = [];
     for (const file of attachedFiles) {
-      let dataVal = "";
+      let dataVal = '';
       if (llmProvider === 'gemini' && file.size > 2 * 1024 * 1024) {
-        addLog('info', `Gemini Cloud: Uploading large attachment '${file.name}' to Google Files API...`);
+        addLog(
+          'info',
+          `Gemini Cloud: Uploading large attachment '${file.name}' to Google Files API...`
+        );
         try {
           const uri = await invoke<string>('upload_file_to_gemini', { path: file.path });
           dataVal = uri;
@@ -499,11 +736,12 @@ const App: React.FC = () => {
     const channel = new Channel<string>();
     channel.onmessage = (message) => {
       // Print build stream directly to our logs panel
-      const type = message.includes('failed') || message.includes('Error')
-        ? 'error'
-        : message.includes('passed') || message.includes('Auto-committed')
-          ? 'success'
-          : 'gemini';
+      const type =
+        message.includes('failed') || message.includes('Error')
+          ? 'error'
+          : message.includes('passed') || message.includes('Auto-committed')
+            ? 'success'
+            : 'gemini';
       addLog(type, message);
     };
 
@@ -543,12 +781,25 @@ const App: React.FC = () => {
     try {
       const fileName = filePath.split(/[/\\]/).pop() || filePath;
       addLog('info', `Attachment: Sniffing file type for '${fileName}'...`);
-      const sniffResult = await invoke<{ mime_type: string; size: number }>('sniff_file_type', { path: filePath });
+      const sniffResult = await invoke<{ mime_type: string; size: number }>('sniff_file_type', {
+        path: filePath,
+      });
       setAttachedFiles((prev) => {
         if (prev.some((f) => f.path === filePath)) return prev;
-        return [...prev, { name: fileName, path: filePath, mimeType: sniffResult.mime_type, size: sniffResult.size }];
+        return [
+          ...prev,
+          {
+            name: fileName,
+            path: filePath,
+            mimeType: sniffResult.mime_type,
+            size: sniffResult.size,
+          },
+        ];
       });
-      addLog('success', `Attachment: Added '${fileName}' (${sniffResult.mime_type}, ${(sniffResult.size / 1024).toFixed(1)} KB).`);
+      addLog(
+        'success',
+        `Attachment: Added '${fileName}' (${sniffResult.mime_type}, ${(sniffResult.size / 1024).toFixed(1)} KB).`
+      );
     } catch (e) {
       addLog('error', `Attachment Error: Failed to attach file: ${e}`);
     }
@@ -585,7 +836,10 @@ const App: React.FC = () => {
             if (filePath) {
               await handleFileAttach(filePath);
             } else {
-              addLog('warn', `Attachment: Dropped file '${file.name}' does not have an absolute system path.`);
+              addLog(
+                'warn',
+                `Attachment: Dropped file '${file.name}' does not have an absolute system path.`
+              );
             }
           }
         }
@@ -717,7 +971,9 @@ const App: React.FC = () => {
   const handleTestConnection = async () => {
     setLlmTestStatus('Testing...');
     try {
-      const result = await invoke<{ success: boolean; latency_ms: number; error: string | null }>('test_llm_connection');
+      const result = await invoke<{ success: boolean; latency_ms: number; error: string | null }>(
+        'test_llm_connection'
+      );
       if (result.success) {
         setLlmTestStatus(`Success (${result.latency_ms}ms)`);
         addLog('success', `LLM Connection Test: Successful. Latency: ${result.latency_ms}ms.`);
@@ -745,7 +1001,9 @@ const App: React.FC = () => {
             <h1 className="text-sm font-bold tracking-wider bg-clip-text text-transparent bg-gradient-to-r from-cyan-400 to-violet-400">
               ANTIGRAVITY WORKSPACE
             </h1>
-            <p className="text-[10px] font-mono text-white/40">v2.0.0 Stable Kernel (Bleeding Edge)</p>
+            <p className="text-[10px] font-mono text-white/40">
+              v2.0.0 Stable Kernel (Bleeding Edge)
+            </p>
           </div>
         </div>
 
@@ -753,7 +1011,9 @@ const App: React.FC = () => {
         <div className="flex items-center space-x-6">
           {activeFilePath && (
             <div className="hidden md:flex items-center space-x-2 bg-white/5 border border-white/5 px-3 py-1 rounded-md text-xs font-mono text-cyan-400">
-              <span className={`w-2 h-2 rounded-full ${hasUnsavedChanges ? 'bg-amber-400 animate-pulse' : 'bg-cyan-400'}`} />
+              <span
+                className={`w-2 h-2 rounded-full ${hasUnsavedChanges ? 'bg-amber-400 animate-pulse' : 'bg-cyan-400'}`}
+              />
               <span className="max-w-[200px] truncate">
                 {activeFilePath.split('\\').pop() || activeFilePath.split('/').pop()}
               </span>
@@ -767,7 +1027,9 @@ const App: React.FC = () => {
               <span className="text-white/60">{workspaceRoot}</span>
             </div>
             <div className="flex items-center space-x-2">
-              <span className={`w-2 h-2 rounded-full ${kernelStatus === 'active' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`} />
+              <span
+                className={`w-2 h-2 rounded-full ${kernelStatus === 'active' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'}`}
+              />
               <span className="text-white/70 uppercase text-[10px] tracking-wider">
                 {kernelStatus === 'active' ? 'Active' : 'Offline'}
               </span>
@@ -778,7 +1040,6 @@ const App: React.FC = () => {
 
       {/* 2. Main Workbench Body */}
       <div className="flex-1 flex overflow-hidden w-full relative">
-        
         {/* Activity Toolbar (Left Icons) */}
         <div className="w-[50px] border-r border-white/5 bg-[#090d13]/85 flex flex-col items-center py-4 space-y-4 flex-shrink-0">
           <button
@@ -812,6 +1073,23 @@ const App: React.FC = () => {
             </svg>
             <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
               Semantic Search
+            </div>
+          </button>
+
+          <button
+            onClick={() => setActiveSidebarTab('git')}
+            className={`p-2.5 rounded-lg transition-all duration-300 relative group ${
+              activeSidebarTab === 'git'
+                ? 'text-cyan-400 bg-cyan-500/10'
+                : 'text-neutral-400 hover:text-white hover:bg-white/5'
+            }`}
+            title="Git Control"
+          >
+            <svg className="w-5 h-5 fill-current" viewBox="0 0 24 24">
+              <path d="M18.8 6c0-1.7-1.3-3-3-3s-3 1.3-3 3c0 1.2.7 2.3 1.7 2.8L13 13.3c-1-.5-2.2-.4-3 .3L5.8 9.8c1-.5 1.7-1.6 1.7-2.8 0-1.7-1.3-3-3-3s-3 1.3-3 3c0 1.2.7 2.3 1.7 2.8v4.4C2.2 14.7 1.5 15.8 1.5 17c0 1.7 1.3 3 3 3s3-1.3 3-3c0-1.2-.7-2.3-1.7-2.8v-4.4l4.2 3.8c-.2.4-.3.9-.3 1.4 0 1.7 1.3 3 3 3s3-1.3 3-3c0-1-.5-2-1.3-2.5l1.6-4.5c.9.5 2 .4 2.8-.3 1-.7 1.4-1.9 1.4-3.1zM4.5 5c.8 0 1.5.7 1.5 1.5S5.3 8 4.5 8 3 7.3 3 6.5 3.7 5 4.5 5zm0 14c-.8 0-1.5-.7-1.5-1.5s.7-1.5 1.5-1.5 1.5.7 1.5 1.5-.7 1.5-1.5 1.5zm11.3-11c-.8 0-1.5-.7-1.5-1.5S15 5 15.8 5s1.5.7 1.5 1.5-.7 1.5-1.5 1.5zm-3.8 11c-.8 0-1.5-.7-1.5-1.5s.7-1.5 1.5-1.5 1.5.7 1.5 1.5-.7 1.5-1.5 1.5z" />
+            </svg>
+            <div className="absolute left-14 top-1/2 -translate-y-1/2 bg-black/80 px-2.5 py-1 text-[10px] font-semibold text-white rounded opacity-0 group-hover:opacity-100 transition-opacity duration-200 pointer-events-none whitespace-nowrap z-30">
+              Git Control
             </div>
           </button>
 
@@ -1010,7 +1288,9 @@ const App: React.FC = () => {
                             className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white"
                           >
                             {llmModelsList.map((m) => (
-                              <option key={m} value={m}>{m}</option>
+                              <option key={m} value={m}>
+                                {m}
+                              </option>
                             ))}
                           </select>
                         ) : (
@@ -1034,7 +1314,9 @@ const App: React.FC = () => {
                       type="password"
                       value={apiToken}
                       onChange={(e) => setApiToken(e.target.value)}
-                      placeholder={llmProvider === 'openai' ? 'Enter key (optional)' : 'Enter Gemini API key'}
+                      placeholder={
+                        llmProvider === 'openai' ? 'Enter key (optional)' : 'Enter Gemini API key'
+                      }
                       className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/50 outline-none rounded-lg text-xs text-white font-mono"
                     />
                   </div>
@@ -1082,7 +1364,7 @@ const App: React.FC = () => {
                     </div>
                   )}
                 </div>
-                
+
                 <div className="pt-4">
                   <button
                     onClick={handleReindex}
@@ -1095,14 +1377,382 @@ const App: React.FC = () => {
               </div>
             </div>
           )}
+
+          {activeSidebarTab === 'git' && (
+            <div className="flex-1 flex flex-col overflow-hidden">
+              {/* Header */}
+              <div className="p-3 border-b border-white/5 flex items-center justify-between">
+                <span className="text-xs font-bold uppercase tracking-widest text-neutral-400">
+                  Git Stage & Commit
+                </span>
+                <div className="flex items-center space-x-2">
+                  <button
+                    onClick={loadGitStatus}
+                    className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-cyan-400 transition-colors"
+                    title="Refresh Git Status"
+                  >
+                    <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+                      <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+                    </svg>
+                  </button>
+                  <button
+                    onClick={handlePush}
+                    disabled={isPushing || !gitBranch || gitBranch === 'DETACHED'}
+                    className="p-1 hover:bg-white/5 disabled:opacity-30 rounded text-neutral-400 hover:text-cyan-400 transition-colors flex items-center justify-center"
+                    title="Push Branch to Remote"
+                  >
+                    {isPushing ? (
+                      <svg
+                        className="w-3.5 h-3.5 animate-spin text-cyan-400"
+                        fill="none"
+                        viewBox="0 0 24 24"
+                      >
+                        <circle
+                          className="opacity-25"
+                          cx="12"
+                          cy="12"
+                          r="10"
+                          stroke="currentColor"
+                          strokeWidth="4"
+                        />
+                        <path
+                          className="opacity-75"
+                          fill="currentColor"
+                          d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
+                        />
+                      </svg>
+                    ) : (
+                      <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+                        <path d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96zM14 13v4h-4v-4H7l5-5 5 5h-3z" />
+                      </svg>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Git Branch Banner */}
+              <div className="px-4 py-2.5 bg-[#0e1726]/40 border-b border-white/5 flex items-center justify-between text-xs font-mono text-cyan-400 select-none">
+                <span className="flex items-center space-x-1.5 truncate max-w-[190px]">
+                  <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+                    <path d="M18.8 6c0-1.7-1.3-3-3-3s-3 1.3-3 3c0 1.2.7 2.3 1.7 2.8L13 13.3c-1-.5-2.2-.4-3 .3L5.8 9.8c1-.5 1.7-1.6 1.7-2.8 0-1.7-1.3-3-3-3s-3 1.3-3 3c0 1.2.7 2.3 1.7 2.8v4.4C2.2 14.7 1.5 15.8 1.5 17c0 1.7 1.3 3 3 3s3-1.3 3-3c0-1.2-.7-2.3-1.7-2.8v-4.4l4.2 3.8c-.2.4-.3.9-.3 1.4 0 1.7 1.3 3 3 3s3-1.3 3-3c0-1-.5-2-1.3-2.5l1.6-4.5c.9.5 2 .4 2.8-.3 1-.7 1.4-1.9 1.4-3.1zm-14.3 13c-.8 0-1.5-.7-1.5-1.5s.7-1.5 1.5-1.5 1.5.7 1.5 1.5-.7 1.5-1.5 1.5zm0-12.5c-.8 0-1.5-.7-1.5-1.5S3.7 5 4.5 5 6 5.7 6 6.5 5.3 8 4.5 8zm11.3 0c-.8 0-1.5-.7-1.5-1.5s.7-1.5 1.5-1.5 1.5.7 1.5 1.5-.7 1.5-1.5 1.5z" />
+                  </svg>
+                  <span>Branch:</span>
+                  <span className="font-bold text-white truncate">{gitBranch || 'loading...'}</span>
+                </span>
+                {gitBranch === 'DETACHED' && (
+                  <span className="text-[9px] px-1.5 py-0.2 rounded bg-rose-500/20 text-rose-400 font-bold">
+                    Detached
+                  </span>
+                )}
+              </div>
+
+              {/* Status File Lists */}
+              <div className="flex-1 overflow-y-auto p-3 space-y-4 custom-scrollbar select-none text-xs">
+                {/* Staged Changes Accordion */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center bg-emerald-500/5 border border-emerald-500/10 px-2.5 py-1.5 rounded-lg select-none">
+                    <span className="font-bold text-emerald-400 font-mono tracking-wide uppercase text-[10px]">
+                      Staged Changes ({gitStatuses.filter((f) => f.status === 'Staged').length})
+                    </span>
+                    {gitStatuses.filter((f) => f.status === 'Staged').length > 0 && (
+                      <button
+                        onClick={handleUnstageAll}
+                        className="text-[9px] hover:underline text-emerald-500 font-semibold cursor-pointer"
+                      >
+                        Unstage All
+                      </button>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    {gitStatuses
+                      .filter((f) => f.status === 'Staged')
+                      .map((file, idx) => (
+                        <div
+                          key={idx}
+                          onClick={() => handleOpenDiff(file)}
+                          className="flex items-center justify-between px-2 py-1.5 hover:bg-emerald-500/5 border border-transparent hover:border-emerald-500/10 rounded-md cursor-pointer group transition-all"
+                        >
+                          <span
+                            className="font-mono text-neutral-300 truncate max-w-[170px]"
+                            title={file.path}
+                          >
+                            {file.path.split(/[/\\]/).pop() || file.path}
+                          </span>
+                          <div className="flex items-center space-x-1.5">
+                            <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-emerald-500/15 text-emerald-400 uppercase">
+                              Staged
+                            </span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleUnstageFile(file.path);
+                              }}
+                              className="p-0.5 rounded hover:bg-emerald-500/20 text-emerald-400 opacity-0 group-hover:opacity-100 transition-all duration-150 cursor-pointer"
+                              title="Unstage file"
+                            >
+                              &minus;
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    {gitStatuses.filter((f) => f.status === 'Staged').length === 0 && (
+                      <div className="text-neutral-500 italic text-[11px] text-center py-2 bg-black/10 rounded-lg">
+                        No staged changes.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Unstaged Changes Accordion (Modified/Deleted) */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center bg-amber-500/5 border border-amber-500/10 px-2.5 py-1.5 rounded-lg select-none">
+                    <span className="font-bold text-amber-400 font-mono tracking-wide uppercase text-[10px]">
+                      Changes ({gitStatuses.filter((f) => f.status === 'Modified').length})
+                    </span>
+                    {gitStatuses.filter((f) => f.status === 'Modified').length > 0 && (
+                      <button
+                        onClick={handleStageAll}
+                        className="text-[9px] hover:underline text-amber-500 font-semibold cursor-pointer"
+                      >
+                        Stage All
+                      </button>
+                    )}
+                  </div>
+                  <div className="space-y-1">
+                    {gitStatuses
+                      .filter((f) => f.status === 'Modified')
+                      .map((file, idx) => (
+                        <div
+                          key={idx}
+                          onClick={() => handleOpenDiff(file)}
+                          className="flex items-center justify-between px-2 py-1.5 hover:bg-amber-500/5 border border-transparent hover:border-amber-500/10 rounded-md cursor-pointer group transition-all"
+                        >
+                          <span
+                            className="font-mono text-neutral-300 truncate max-w-[170px]"
+                            title={file.path}
+                          >
+                            {file.path.split(/[/\\]/).pop() || file.path}
+                          </span>
+                          <div className="flex items-center space-x-1.5">
+                            <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-amber-500/15 text-amber-400 uppercase">
+                              Modified
+                            </span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleStageFile(file.path);
+                              }}
+                              className="p-0.5 rounded hover:bg-amber-500/20 text-amber-400 opacity-0 group-hover:opacity-100 transition-all duration-150 cursor-pointer"
+                              title="Stage file"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    {gitStatuses.filter((f) => f.status === 'Modified').length === 0 && (
+                      <div className="text-neutral-500 italic text-[11px] text-center py-2 bg-black/10 rounded-lg">
+                        No modified files.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* Untracked Files Accordion */}
+                <div className="space-y-1.5">
+                  <div className="bg-neutral-500/5 border border-neutral-500/10 px-2.5 py-1.5 rounded-lg select-none">
+                    <span className="font-bold text-neutral-400 font-mono tracking-wide uppercase text-[10px]">
+                      Untracked ({gitStatuses.filter((f) => f.status === 'Untracked').length})
+                    </span>
+                  </div>
+                  <div className="space-y-1">
+                    {gitStatuses
+                      .filter((f) => f.status === 'Untracked')
+                      .map((file, idx) => (
+                        <div
+                          key={idx}
+                          onClick={() => handleOpenDiff(file)}
+                          className="flex items-center justify-between px-2 py-1.5 hover:bg-white/5 border border-transparent hover:border-white/10 rounded-md cursor-pointer group transition-all"
+                        >
+                          <span
+                            className="font-mono text-neutral-400 truncate max-w-[170px]"
+                            title={file.path}
+                          >
+                            {file.path.split(/[/\\]/).pop() || file.path}
+                          </span>
+                          <div className="flex items-center space-x-1.5">
+                            <span className="text-[9px] font-bold px-1.5 py-0.2 rounded bg-neutral-800 text-neutral-400 uppercase">
+                              Untracked
+                            </span>
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleStageFile(file.path);
+                              }}
+                              className="p-0.5 rounded hover:bg-white/10 text-neutral-400 opacity-0 group-hover:opacity-100 transition-all duration-150 cursor-pointer"
+                              title="Stage file"
+                            >
+                              +
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    {gitStatuses.filter((f) => f.status === 'Untracked').length === 0 && (
+                      <div className="text-neutral-500 italic text-[11px] text-center py-2 bg-black/10 rounded-lg">
+                        No untracked files.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                {/* AI Commit generator panel */}
+                <div className="pt-3 border-t border-white/5 space-y-3">
+                  <button
+                    onClick={handleGenerateCommit}
+                    disabled={
+                      isGeneratingCommit ||
+                      gitStatuses.filter((f) => f.status === 'Staged').length === 0
+                    }
+                    className="w-full py-2 bg-gradient-to-tr from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold active:scale-95 transition-all cursor-pointer shadow-md shadow-cyan-500/10 flex items-center justify-center space-x-1.5"
+                  >
+                    <span>
+                      {isGeneratingCommit ? 'Analyzing Diff...' : '✨ Generate Commit Message'}
+                    </span>
+                  </button>
+
+                  {/* Warning banner if secrets found */}
+                  {hasSecretsInStaged && (
+                    <div className="p-3 bg-rose-500/15 border border-rose-500/30 text-rose-300 rounded-lg space-y-1 font-mono text-[10px] leading-relaxed animate-pulse">
+                      <div className="font-bold uppercase tracking-wider text-rose-400 flex items-center">
+                        ⚠️ Credentials Leak Warning
+                      </div>
+                      <div>
+                        Potential API keys or private tokens detected in your staged diff. Purge
+                        credentials from files before committing!
+                      </div>
+                    </div>
+                  )}
+
+                  {/* AI Impact summary card */}
+                  {impactSummary && (
+                    <div className="p-2.5 bg-fuchsia-950/10 border border-fuchsia-500/20 rounded-lg space-y-1">
+                      <span className="text-[9px] font-bold text-fuchsia-400 uppercase tracking-wider block font-mono">
+                        🔍 AI Impact Summary
+                      </span>
+                      <p className="text-[10px] text-white/70 leading-relaxed font-sans">
+                        {impactSummary}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* Commit message input textarea */}
+                  <div className="space-y-1.5 relative">
+                    <label className="text-[9px] font-semibold text-white/30 uppercase tracking-wider block font-mono">
+                      Commit Message
+                    </label>
+                    <textarea
+                      value={commitMessage}
+                      onChange={(e) => setCommitMessage(e.target.value)}
+                      rows={3}
+                      className="w-full px-2.5 py-2 bg-black/40 border border-white/10 focus:border-cyan-500/40 outline-none rounded-lg text-[11px] text-white font-mono leading-relaxed"
+                      placeholder="e.g. feat(sidebar): add git stage panel"
+                    />
+
+                    {/* Character limit indicator for subject line (first line) */}
+                    {commitMessage && (
+                      <div className="flex justify-between items-center text-[9px] font-mono text-white/30 px-1 mt-0.5">
+                        <span>Subject: {commitMessage.split('\n')[0]?.length || 0} / 50</span>
+                        <span
+                          className={
+                            (commitMessage.split('\n')[0]?.length || 0) > 50
+                              ? 'text-amber-400 font-bold'
+                              : ''
+                          }
+                        >
+                          {(commitMessage.split('\n')[0]?.length || 0) > 50
+                            ? 'Too Long'
+                            : 'Optimal'}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Live Conventional Commit linter cards checklist */}
+                  {commitMessage && (
+                    <div className="p-2.5 bg-black/20 border border-white/5 rounded-lg space-y-1.5 font-mono text-[10px]">
+                      <span className="text-[8px] font-semibold text-white/30 uppercase tracking-wider block">
+                        Conventional Commit Lint Checklist
+                      </span>
+
+                      {/* Check 1: Format validation */}
+                      <div className="flex items-center space-x-2">
+                        {/^[a-z]+(\([a-z0-9_-]+\))?: .+/i.test(
+                          commitMessage.split('\n')[0] || ''
+                        ) ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-rose-400">✗</span>
+                        )}
+                        <span className="text-white/60">Fits type(scope): subject</span>
+                      </div>
+
+                      {/* Check 2: Valid conventional type check */}
+                      <div className="flex items-center space-x-2">
+                        {/^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([a-z0-9_-]+\))?: .+/i.test(
+                          commitMessage.split('\n')[0] || ''
+                        ) ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-rose-400">✗</span>
+                        )}
+                        <span className="text-white/60">Type: feat, fix, docs, refactor...</span>
+                      </div>
+
+                      {/* Check 3: Capitalization (starts lowercase) */}
+                      <div className="flex items-center space-x-2">
+                        {/^[a-z]+(\([a-z0-9_-]+\))?: [a-z].+/.test(
+                          commitMessage.split('\n')[0] || ''
+                        ) ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-amber-400">⚠</span>
+                        )}
+                        <span className="text-white/60">Subject starts lowercase</span>
+                      </div>
+
+                      {/* Check 4: No trailing period */}
+                      <div className="flex items-center space-x-2">
+                        {!(commitMessage.split('\n')[0] || '').trim().endsWith('.') ? (
+                          <span className="text-emerald-400">✓</span>
+                        ) : (
+                          <span className="text-amber-400">⚠</span>
+                        )}
+                        <span className="text-white/60">No trailing period</span>
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Primary Commit Button */}
+                  <button
+                    onClick={handleCommit}
+                    disabled={
+                      !commitMessage.trim() ||
+                      gitStatuses.filter((f) => f.status === 'Staged').length === 0
+                    }
+                    className="w-full py-2.5 bg-gradient-to-tr from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-50 text-white rounded-lg text-xs font-semibold active:scale-95 transition-all cursor-pointer shadow-md shadow-cyan-500/20"
+                  >
+                    Commit Staged Changes
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
         </aside>
 
         {/* Center / Editor Area */}
         <main className="flex-1 flex flex-col overflow-hidden bg-[#07090e] relative">
-          
           {/* Main workspace layout splits: Editor (top) + Console (bottom) */}
           <div className="flex-1 flex flex-col min-h-0 relative">
-            
             {/* Editor Workspace */}
             <div className="flex-1 flex flex-col min-h-0 relative">
               {activeFilePath ? (
@@ -1111,9 +1761,10 @@ const App: React.FC = () => {
                   <div className="h-10 bg-[#0c0f16] border-b border-white/5 flex items-center overflow-x-auto select-none custom-scrollbar z-10 flex-shrink-0">
                     {openTabs.map((tabPath) => {
                       const isActive = activeFilePath === tabPath;
-                      const tabName = tabPath.split('\\').pop() || tabPath.split('/').pop() || 'File';
+                      const tabName =
+                        tabPath.split('\\').pop() || tabPath.split('/').pop() || 'File';
                       const isUnsaved = tabPath === activeFilePath && hasUnsavedChanges;
-                      
+
                       return (
                         <div
                           key={tabPath}
@@ -1155,8 +1806,9 @@ const App: React.FC = () => {
                       onContentChange={setActiveFileContent}
                       onSave={handleSaveActiveFile}
                       diagnostics={diagnostics}
+                      diffMode={diffMode}
+                      originalContent={diffOriginalContent}
                     />
-
                   </div>
                 </div>
               ) : (
@@ -1174,10 +1826,11 @@ const App: React.FC = () => {
                           Double-compile Self-Healing Engine
                         </h2>
                         <p className="text-xs text-white/50 max-w-md leading-relaxed">
-                          Select any file in the Sidebar File Explorer to initialize Monaco workspace compiler contexts. Write code and compile natively in real-time.
+                          Select any file in the Sidebar File Explorer to initialize Monaco
+                          workspace compiler contexts. Write code and compile natively in real-time.
                         </p>
                       </div>
-                      
+
                       <div className="mt-4 md:mt-0 flex space-x-3 flex-shrink-0">
                         <button
                           onClick={handleReindex}
@@ -1193,14 +1846,26 @@ const App: React.FC = () => {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
                       {/* Self healing flowchart */}
                       <div className="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 className="text-sm font-semibold text-white">Compiler Self-Healing Flowchart</h3>
-                        
+                        <h3 className="text-sm font-semibold text-white">
+                          Compiler Self-Healing Flowchart
+                        </h3>
+
                         <div className="flex items-center justify-between py-2 font-mono text-[10px]">
                           {/* Node 1 */}
                           <div className="flex flex-col items-center space-y-2">
                             <div className="w-11 h-11 rounded-full bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center text-cyan-400">
-                              <svg className="w-5.5 h-5.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                              <svg
+                                className="w-5.5 h-5.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z"
+                                />
                               </svg>
                             </div>
                             <span className="text-[10px] text-white">Dev Workspace</span>
@@ -1211,8 +1876,18 @@ const App: React.FC = () => {
                           {/* Node 2 */}
                           <div className="flex flex-col items-center space-y-2">
                             <div className="w-11 h-11 rounded-full bg-rose-500/20 border border-rose-500/30 flex items-center justify-center text-rose-400">
-                              <svg className="w-5.5 h-5.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+                              <svg
+                                className="w-5.5 h-5.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"
+                                />
                               </svg>
                             </div>
                             <span className="text-[10px] text-white">Compile Fail</span>
@@ -1223,8 +1898,18 @@ const App: React.FC = () => {
                           {/* Node 3 */}
                           <div className="flex flex-col items-center space-y-2">
                             <div className="w-11 h-11 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-amber-400">
-                              <svg className="w-5.5 h-5.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 01-2 2h0a2 2 0 01-2 2h-2.5" />
+                              <svg
+                                className="w-5.5 h-5.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  d="M9.663 17h4.673M12 3v1m6.364 1.636l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 01-2 2h0a2 2 0 01-2 2h-2.5"
+                                />
                               </svg>
                             </div>
                             <span className="text-[10px] text-white">Gemini API</span>
@@ -1235,8 +1920,18 @@ const App: React.FC = () => {
                           {/* Node 4 */}
                           <div className="flex flex-col items-center space-y-2">
                             <div className="w-11 h-11 rounded-full bg-emerald-500/20 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
-                              <svg className="w-5.5 h-5.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
-                                <path strokeLinecap="round" strokeLinejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                              <svg
+                                className="w-5.5 h-5.5"
+                                fill="none"
+                                stroke="currentColor"
+                                strokeWidth="2"
+                                viewBox="0 0 24 24"
+                              >
+                                <path
+                                  strokeLinecap="round"
+                                  strokeLinejoin="round"
+                                  d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"
+                                />
                               </svg>
                             </div>
                             <span className="text-[10px] text-white">Auto Commit</span>
@@ -1247,9 +1942,13 @@ const App: React.FC = () => {
                       {/* File watcher activity stream */}
                       <div className="glass-panel p-6 rounded-xl space-y-4">
                         <div className="flex items-center justify-between">
-                          <h3 className="text-sm font-semibold text-white">VFS File Watcher Monitor</h3>
+                          <h3 className="text-sm font-semibold text-white">
+                            VFS File Watcher Monitor
+                          </h3>
                           <div className="flex items-center space-x-1.5">
-                            <span className={`w-1.5 h-1.5 rounded-full ${watcherActive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`} />
+                            <span
+                              className={`w-1.5 h-1.5 rounded-full ${watcherActive ? 'bg-emerald-500 animate-pulse' : 'bg-amber-500'}`}
+                            />
                             <span className="text-[9px] font-mono text-white/40">
                               {watcherActive ? 'Crawl Active' : 'Idle'}
                             </span>
@@ -1262,7 +1961,10 @@ const App: React.FC = () => {
                         ) : (
                           <div className="max-h-[160px] overflow-y-auto space-y-1.5 pr-1 custom-scrollbar">
                             {fileChanges.slice(0, 10).map((fc, i) => (
-                              <div key={i} className="flex items-center justify-between px-2.5 py-1.5 bg-black/20 border border-white/5 rounded-md">
+                              <div
+                                key={i}
+                                className="flex items-center justify-between px-2.5 py-1.5 bg-black/20 border border-white/5 rounded-md"
+                              >
                                 <span className="text-[10px] text-white/70 font-mono truncate max-w-[200px]">
                                   {fc.path.split('\\').pop() || fc.path.split('/').pop()}
                                 </span>
@@ -1279,7 +1981,9 @@ const App: React.FC = () => {
                     {/* Symbol list table */}
                     {symbolIndex.length > 0 && (
                       <div className="glass-panel p-6 rounded-xl space-y-4">
-                        <h3 className="text-sm font-semibold text-white">AST Code Symbol cache (sqlite-vec)</h3>
+                        <h3 className="text-sm font-semibold text-white">
+                          AST Code Symbol cache (sqlite-vec)
+                        </h3>
                         <div className="max-h-[300px] overflow-y-auto custom-scrollbar border border-white/5 rounded-lg">
                           <table className="w-full text-left border-collapse text-[11px]">
                             <thead>
@@ -1293,19 +1997,24 @@ const App: React.FC = () => {
                             <tbody className="font-mono text-white/70">
                               {symbolIndex.slice(0, 50).flatMap((file) =>
                                 file.symbols.slice(0, 5).map((sym, j) => (
-                                  <tr key={`${file.path}-${j}`} className="border-b border-white/3 hover:bg-white/3">
+                                  <tr
+                                    key={`${file.path}-${j}`}
+                                    className="border-b border-white/3 hover:bg-white/3"
+                                  >
                                     <td className="p-3 text-white/40 truncate max-w-[150px]">
                                       {file.path.split('\\').pop() || file.path.split('/').pop()}
                                     </td>
                                     <td className="p-3 text-white font-semibold">{sym.name}</td>
                                     <td className="p-3">
-                                      <span className={`px-1.5 py-0.5 rounded text-[8px] font-bold uppercase ${
-                                        sym.kind === 'function'
-                                          ? 'bg-violet-500/15 text-violet-400'
-                                          : sym.kind === 'struct' || sym.kind === 'class'
-                                            ? 'bg-amber-500/15 text-amber-400'
-                                            : 'bg-white/10 text-white/50'
-                                      }`}>
+                                      <span
+                                        className={`px-1.5 py-0.5 rounded text-[8px] font-bold uppercase ${
+                                          sym.kind === 'function'
+                                            ? 'bg-violet-500/15 text-violet-400'
+                                            : sym.kind === 'struct' || sym.kind === 'class'
+                                              ? 'bg-amber-500/15 text-amber-400'
+                                              : 'bg-white/10 text-white/50'
+                                        }`}
+                                      >
                                         {sym.kind}
                                       </span>
                                     </td>
@@ -1326,9 +2035,11 @@ const App: React.FC = () => {
             </div>
 
             {/* Bottom Panel (Console & Terminal) */}
-            <div className={`border-t border-white/5 bg-[#080b11] transition-all duration-300 flex flex-col flex-shrink-0 ${
-              consoleCollapsed ? 'h-10' : 'h-[250px]'
-            }`}>
+            <div
+              className={`border-t border-white/5 bg-[#080b11] transition-all duration-300 flex flex-col flex-shrink-0 ${
+                consoleCollapsed ? 'h-10' : 'h-[250px]'
+              }`}
+            >
               {/* Console Header */}
               <div className="h-10 border-b border-white/5 flex items-center justify-between px-6 bg-black/10 flex-shrink-0">
                 <div className="flex items-center space-x-4">
@@ -1396,11 +2107,18 @@ const App: React.FC = () => {
                       {attachedFiles.length > 0 && (
                         <div className="flex flex-wrap gap-2 pb-1 border-b border-white/5">
                           {attachedFiles.map((file, idx) => (
-                            <div key={idx} className="flex items-center space-x-1.5 px-2.5 py-1 bg-white/5 border border-white/10 rounded-md text-[10px] text-cyan-400 font-mono transition-all hover:bg-white/10">
-                              <span>📎 {file.name} ({(file.size / 1024).toFixed(1)} KB)</span>
+                            <div
+                              key={idx}
+                              className="flex items-center space-x-1.5 px-2.5 py-1 bg-white/5 border border-white/10 rounded-md text-[10px] text-cyan-400 font-mono transition-all hover:bg-white/10"
+                            >
+                              <span>
+                                📎 {file.name} ({(file.size / 1024).toFixed(1)} KB)
+                              </span>
                               <button
                                 type="button"
-                                onClick={() => setAttachedFiles(prev => prev.filter((_, i) => i !== idx))}
+                                onClick={() =>
+                                  setAttachedFiles((prev) => prev.filter((_, i) => i !== idx))
+                                }
                                 className="text-neutral-400 hover:text-rose-400 font-bold cursor-pointer ml-1 text-xs"
                               >
                                 &times;
@@ -1411,7 +2129,10 @@ const App: React.FC = () => {
                       )}
 
                       {/* Form input */}
-                      <form onSubmit={handleTestCommand} className="flex space-x-3 items-center flex-shrink-0">
+                      <form
+                        onSubmit={handleTestCommand}
+                        className="flex space-x-3 items-center flex-shrink-0"
+                      >
                         <span className="text-xs text-cyan-400 font-bold">$</span>
                         <input
                           type="text"
@@ -1435,19 +2156,25 @@ const App: React.FC = () => {
                           disabled={geminiStatus === 'streaming'}
                           className="px-4 py-1.5 bg-gradient-to-tr from-cyan-600 to-blue-600 hover:from-cyan-500 hover:to-blue-500 disabled:opacity-50 text-white rounded-md text-xs font-semibold active:scale-95 transition-all cursor-pointer shadow-md shadow-cyan-500/10"
                         >
-                          {geminiStatus === 'streaming' ? 'Healing Loop Running...' : 'Trigger Build'}
+                          {geminiStatus === 'streaming'
+                            ? 'Healing Loop Running...'
+                            : 'Trigger Build'}
                         </button>
                       </form>
-                      
+
                       {/* Log Console Output */}
                       <div className="flex-1 overflow-y-auto px-4 py-2 bg-black/30 border border-white/5 rounded-md text-[10px] leading-relaxed custom-scrollbar text-neutral-300">
-                        <div className="text-white/40">{"// Self-Healing compiler loop outputs stream here..."}</div>
-                        {logs.filter(l => l.message.includes('[Self-Healing Engine]')).map((log) => (
-                          <div key={log.id} className="mt-1">
-                            <span className="text-white/20 mr-2">{log.time}</span>
-                            <span className="text-white/80">{parseAnsi(log.message)}</span>
-                          </div>
-                        ))}
+                        <div className="text-white/40">
+                          {'// Self-Healing compiler loop outputs stream here...'}
+                        </div>
+                        {logs
+                          .filter((l) => l.message.includes('[Self-Healing Engine]'))
+                          .map((log) => (
+                            <div key={log.id} className="mt-1">
+                              <span className="text-white/20 mr-2">{log.time}</span>
+                              <span className="text-white/80">{parseAnsi(log.message)}</span>
+                            </div>
+                          ))}
                       </div>
                     </div>
                   ) : (
@@ -1457,19 +2184,23 @@ const App: React.FC = () => {
                         <div key={log.id} className="space-y-0.5">
                           <div className="flex items-center space-x-2">
                             <span className="text-white/20">{log.time}</span>
-                            <span className={`px-1.5 py-0.2 rounded text-[8px] font-bold uppercase tracking-wider ${
-                              log.type === 'success'
-                                ? 'bg-emerald-500/10 text-emerald-400'
-                                : log.type === 'error'
-                                  ? 'bg-rose-500/10 text-rose-400 font-bold'
-                                  : log.type === 'watcher'
-                                    ? 'bg-cyan-500/10 text-cyan-400'
-                                    : 'bg-white/5 text-white/55'
-                            }`}>
+                            <span
+                              className={`px-1.5 py-0.2 rounded text-[8px] font-bold uppercase tracking-wider ${
+                                log.type === 'success'
+                                  ? 'bg-emerald-500/10 text-emerald-400'
+                                  : log.type === 'error'
+                                    ? 'bg-rose-500/10 text-rose-400 font-bold'
+                                    : log.type === 'watcher'
+                                      ? 'bg-cyan-500/10 text-cyan-400'
+                                      : 'bg-white/5 text-white/55'
+                              }`}
+                            >
                               {log.type}
                             </span>
                           </div>
-                          <div className="text-white/80 pl-2 whitespace-pre-wrap">{parseAnsi(log.message)}</div>
+                          <div className="text-white/80 pl-2 whitespace-pre-wrap">
+                            {parseAnsi(log.message)}
+                          </div>
                         </div>
                       ))}
                       <div ref={logEndRef} />
