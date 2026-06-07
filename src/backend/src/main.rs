@@ -1358,7 +1358,7 @@ async fn self_healing_loop(
     let max_depth = 3;
 
     let is_git = crate::git::is_git_repo(&workspace);
-    let original_branch = if is_git {
+    let mut original_branch = if is_git {
         crate::git::git_current_branch(&workspace).ok()
     } else {
         None
@@ -1366,11 +1366,35 @@ async fn self_healing_loop(
     let temp_branch = "antigravity-healing-temp";
 
     if is_git {
-        if let Ok(repo) = git2::Repository::open(&workspace) {
-            if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
-                if let Some(ref orig) = original_branch {
-                    let _ = crate::git::git_checkout_branch(&workspace, orig);
+        if let Ok(repo) = crate::git::open_repo(&workspace) {
+            let mut current_is_temp = false;
+            if let Some(ref orig) = original_branch {
+                if orig == temp_branch {
+                    current_is_temp = true;
                 }
+            }
+
+            if current_is_temp {
+                let mut fallback_branch = None;
+                if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
+                    for b_res in branches {
+                        if let Ok((b, _)) = b_res {
+                            if let Ok(Some(name)) = b.name() {
+                                if name != temp_branch {
+                                    fallback_branch = Some(name.to_string());
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref fallback) = fallback_branch {
+                    let _ = crate::git::git_checkout_branch(&workspace, fallback);
+                    original_branch = Some(fallback.clone());
+                }
+            }
+
+            if let Ok(mut branch) = repo.find_branch(temp_branch, git2::BranchType::Local) {
                 let _ = branch.delete();
             }
         }
@@ -3100,6 +3124,892 @@ async fn upload_file_to_gemini(path: String, state: State<'_, AppState>) -> Resu
     Ok(result.file.uri)
 }
 
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Debug, Clone)]
+pub struct SwarmTask {
+    pub id: String,
+    pub agent_id: String,
+    pub role: String,
+    pub description: String,
+    pub dependencies: Vec<String>,
+    pub status: String,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "type")]
+enum AssistantEvent {
+    #[serde(rename = "token")]
+    Token { content: String },
+    #[serde(rename = "action_start")]
+    ActionStart { action: String, detail: String },
+    #[serde(rename = "action_log")]
+    ActionLog { content: String },
+    #[serde(rename = "action_end")]
+    ActionEnd { success: bool, detail: String },
+    #[serde(rename = "error")]
+    Error { message: String },
+}
+
+#[derive(serde::Serialize, Debug, Clone)]
+#[serde(tag = "type")]
+enum SwarmEvent {
+    #[serde(rename = "swarm_start")]
+    SwarmStart { plan: Vec<SwarmTask> },
+    #[serde(rename = "agent_status")]
+    AgentStatus {
+        agent_id: String,
+        role: String,
+        status: String,
+        current_task: String,
+    },
+    #[serde(rename = "agent_token")]
+    AgentToken { agent_id: String, token: String },
+    #[serde(rename = "agent_log")]
+    AgentLog { agent_id: String, content: String },
+    #[serde(rename = "swarm_end")]
+    SwarmEnd { success: bool },
+}
+
+enum AssistantAction {
+    WriteFile { path: String, content: String },
+    RunCommand { command: String },
+    ReadFile { path: String },
+}
+
+fn parse_actions(text: &str) -> Vec<AssistantAction> {
+    let mut actions = Vec::new();
+    let mut lines = text.lines().peekable();
+    
+    while let Some(line) = lines.next() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```write-file") {
+            let path = if let Some(start_idx) = trimmed.find("path=\"") {
+                let sub = &trimmed[start_idx + 6..];
+                if let Some(end_idx) = sub.find('"') {
+                    sub[..end_idx].to_string()
+                } else {
+                    "file.txt".to_string()
+                }
+            } else {
+                "file.txt".to_string()
+            };
+            
+            let mut content = String::new();
+            while let Some(next_line) = lines.peek() {
+                if next_line.trim().starts_with("```") {
+                    lines.next();
+                    break;
+                }
+                content.push_str(next_line);
+                content.push('\n');
+                lines.next();
+            }
+            actions.push(AssistantAction::WriteFile { path, content });
+        } else if trimmed.starts_with("```run-command") {
+            let mut command = String::new();
+            while let Some(next_line) = lines.peek() {
+                if next_line.trim().starts_with("```") {
+                    lines.next();
+                    break;
+                }
+                command.push_str(next_line);
+                command.push('\n');
+                lines.next();
+            }
+            actions.push(AssistantAction::RunCommand { command: command.trim().to_string() });
+        } else if trimmed.starts_with("```read-file") {
+            let path = if let Some(start_idx) = trimmed.find("path=\"") {
+                let sub = &trimmed[start_idx + 6..];
+                if let Some(end_idx) = sub.find('"') {
+                    sub[..end_idx].to_string()
+                } else {
+                    "file.txt".to_string()
+                }
+            } else {
+                "file.txt".to_string()
+            };
+            while let Some(next_line) = lines.peek() {
+                if next_line.trim().starts_with("```") {
+                    lines.next();
+                    break;
+                }
+                lines.next();
+            }
+            actions.push(AssistantAction::ReadFile { path });
+        }
+    }
+    
+    actions
+}
+
+fn resolve_safe_path(workspace: &str, relative_path: &str) -> Result<std::path::PathBuf, String> {
+    let base = std::path::Path::new(workspace);
+    let target = base.join(relative_path);
+    let mut normalized = std::path::PathBuf::new();
+    for component in target.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            std::path::Component::Normal(c) => {
+                normalized.push(c);
+            }
+            std::path::Component::CurDir => {}
+            other => {
+                normalized.push(other.as_os_str());
+            }
+        }
+    }
+    
+    if normalized.starts_with(base) {
+        Ok(normalized)
+    } else {
+        Err(format!("Access denied: path '{}' escapes workspace root", relative_path))
+    }
+}
+
+async fn execute_assistant_actions(
+    actions: Vec<AssistantAction>,
+    workspace: &str,
+    channel: &tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    for action in actions {
+        match action {
+            AssistantAction::WriteFile { path, content } => {
+                let resolved = resolve_safe_path(workspace, &path)?;
+                let start_event = AssistantEvent::ActionStart {
+                    action: "write-file".to_string(),
+                    detail: format!("Writing file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+
+                if let Some(parent) = resolved.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                let success = match std::fs::write(&resolved, content) {
+                    Ok(_) => {
+                        let log_event = AssistantEvent::ActionLog {
+                            content: format!("Successfully wrote file: {}", path),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        true
+                    }
+                    Err(e) => {
+                        let log_event = AssistantEvent::ActionLog {
+                            content: format!("Error writing file {}: {}", path, e),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        false
+                    }
+                };
+
+                let end_event = AssistantEvent::ActionEnd {
+                    success,
+                    detail: format!("Wrote file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&end_event).unwrap());
+            }
+            AssistantAction::ReadFile { path } => {
+                let resolved = resolve_safe_path(workspace, &path)?;
+                let start_event = AssistantEvent::ActionStart {
+                    action: "read-file".to_string(),
+                    detail: format!("Reading file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+
+                let success = match std::fs::read_to_string(&resolved) {
+                    Ok(content) => {
+                        let log_event = AssistantEvent::ActionLog {
+                            content,
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        true
+                    }
+                    Err(e) => {
+                        let log_event = AssistantEvent::ActionLog {
+                            content: format!("Error reading file {}: {}", path, e),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        false
+                    }
+                };
+
+                let end_event = AssistantEvent::ActionEnd {
+                    success,
+                    detail: format!("Read file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&end_event).unwrap());
+            }
+            AssistantAction::RunCommand { command } => {
+                let start_event = AssistantEvent::ActionStart {
+                    action: "run-command".to_string(),
+                    detail: format!("Running command: {}", command),
+                };
+                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+
+                let parsed = parse_command_string(&command);
+                let success = if let Some((program, args)) = parsed {
+                    let (proc_tx, mut proc_rx) = tokio::sync::mpsc::channel(100);
+                    let channel_clone = channel.clone();
+                    let log_forwarder = tokio::spawn(async move {
+                        while let Some(line) = proc_rx.recv().await {
+                            let event = AssistantEvent::ActionLog { content: line };
+                            if let Ok(serialized) = serde_json::to_string(&event) {
+                                let _ = channel_clone.send(serialized);
+                            }
+                        }
+                    });
+
+                    let run_res = run_process_and_stream(&program, &args, workspace, proc_tx).await;
+                    let _ = log_forwarder.await;
+
+                    match run_res {
+                        Ok((exit_code, _)) => {
+                            let log_event = AssistantEvent::ActionLog {
+                                content: format!("Process exited with status code: {}", exit_code),
+                            };
+                            let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                            exit_code == 0
+                        }
+                        Err(e) => {
+                            let log_event = AssistantEvent::ActionLog {
+                                content: format!("Error running process: {}", e),
+                            };
+                            let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                            false
+                        }
+                    }
+                } else {
+                    let log_event = AssistantEvent::ActionLog {
+                        content: "Invalid command string".to_string(),
+                    };
+                    let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                    false
+                };
+
+                let end_event = AssistantEvent::ActionEnd {
+                    success,
+                    detail: format!("Command executed: {}", command),
+                };
+                let _ = channel.send(serde_json::to_string(&end_event).unwrap());
+            }
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_chat_assistant(
+    prompt: String,
+    history: Vec<ChatMessage>,
+    channel: tauri::ipc::Channel<String>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let workspace = {
+        let ws = state.workspace_root.lock().unwrap();
+        ws.clone()
+    };
+
+    let provider = {
+        let p = state.llm_provider.lock().unwrap();
+        p.clone()
+    };
+
+    let endpoint = {
+        let e = state.llm_endpoint.lock().unwrap();
+        e.clone()
+    };
+
+    let model = {
+        let m = state.llm_model.lock().unwrap();
+        m.clone()
+    };
+
+    let api_key_obf = {
+        let key = state.api_token.lock().unwrap();
+        key.clone()
+    };
+
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                obf
+            } else {
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    crate::security::ObfBox::new(env_key.as_bytes())
+                } else {
+                    return Err(format!(
+                        "API Key is not configured for provider '{}'. Please configure one in Settings.",
+                        provider
+                    ));
+                }
+            }
+        }
+    };
+
+    let mut system_instructions = format!(
+        "You are Antigravity's built-in Agentic Chat Assistant. You have access to the user's workspace at: {}.\n\
+        You can read files, write files, and run terminal commands to help the user.\n\
+        Available Action Blocks:\n\n\
+        1. Write File:\n\
+        ```write-file path=\"relative/path/to/file.txt\"\n\
+        file content\n\
+        ```\n\n\
+        2. Run Command:\n\
+        ```run-command\n\
+        command to run\n\
+        ```\n\n\
+        3. Read File:\n\
+        ```read-file path=\"relative/path/to/file.txt\"\n\
+        ```\n\n\
+        Rules:\n\
+        - Paths must be relative to the workspace root. Do not use absolute paths.\n\
+        - You can explain your reasoning before and after action blocks.\n\
+        - The system will parse your output, execute the actions in order, and stream logs back to the user.\n\n\
+        Conversation History:\n",
+        workspace
+    );
+
+    for msg in &history {
+        system_instructions.push_str(&format!("[{}]: {}\n", msg.role, msg.content));
+    }
+    system_instructions.push_str(&format!("[user]: {}\n", prompt));
+    system_instructions.push_str("[assistant]: ");
+
+    let (api_tx, mut api_rx) = tokio::sync::mpsc::channel(100);
+    let provider_clone = provider.clone();
+    let endpoint_clone = endpoint.clone();
+    let model_clone = model.clone();
+    let final_api_key_clone = final_api_key.clone();
+    let system_instructions_clone = system_instructions.clone();
+    let app_handle_clone = app_handle.clone();
+
+    tokio::spawn(async move {
+        let _ = crate::inference::stream_generate_content_multiplexed(
+            &provider_clone,
+            endpoint_clone.as_deref(),
+            model_clone.as_deref(),
+            &final_api_key_clone,
+            &system_instructions_clone,
+            None,
+            api_tx,
+            Some(app_handle_clone),
+        )
+        .await;
+    });
+
+    let mut full_response = String::new();
+    while let Some(token) = api_rx.recv().await {
+        full_response.push_str(&token);
+        let event = AssistantEvent::Token { content: token };
+        if let Ok(serialized) = serde_json::to_string(&event) {
+            let _ = channel.send(serialized);
+        }
+    }
+
+    let actions = parse_actions(&full_response);
+    if !actions.is_empty() {
+        if let Err(e) = execute_assistant_actions(actions, &workspace, &channel).await {
+            let error_event = AssistantEvent::Error { message: e };
+            if let Ok(serialized) = serde_json::to_string(&error_event) {
+                let _ = channel.send(serialized);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn clean_json_response(res: &str) -> String {
+    let mut cleaned = res.trim().to_string();
+    if cleaned.starts_with("```json") {
+        cleaned = cleaned.replace("```json", "");
+    } else if cleaned.starts_with("```") {
+        cleaned = cleaned.replace("```", "");
+    }
+    if cleaned.ends_with("```") {
+        cleaned.truncate(cleaned.len() - 3);
+    }
+    cleaned.trim().to_string()
+}
+
+async fn execute_swarm_agent_actions(
+    actions: Vec<AssistantAction>,
+    agent_id: &str,
+    workspace: &str,
+    channel: &tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    for action in actions {
+        match action {
+            AssistantAction::WriteFile { path, content } => {
+                let resolved = resolve_safe_path(workspace, &path)?;
+                let log_start = SwarmEvent::AgentLog {
+                    agent_id: agent_id.to_string(),
+                    content: format!("Wrote file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&log_start).unwrap());
+
+                if let Some(parent) = resolved.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+
+                match std::fs::write(&resolved, content) {
+                    Ok(_) => {
+                        let log_event = SwarmEvent::AgentLog {
+                            agent_id: agent_id.to_string(),
+                            content: format!("Successfully wrote file: {}", path),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                    }
+                    Err(e) => {
+                        let log_event = SwarmEvent::AgentLog {
+                            agent_id: agent_id.to_string(),
+                            content: format!("Error writing file {}: {}", path, e),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            AssistantAction::ReadFile { path } => {
+                let resolved = resolve_safe_path(workspace, &path)?;
+                let log_start = SwarmEvent::AgentLog {
+                    agent_id: agent_id.to_string(),
+                    content: format!("Reading file: {}", path),
+                };
+                let _ = channel.send(serde_json::to_string(&log_start).unwrap());
+
+                match std::fs::read_to_string(&resolved) {
+                    Ok(content) => {
+                        let log_event = SwarmEvent::AgentLog {
+                            agent_id: agent_id.to_string(),
+                            content: format!("--- Content of {} ---\n{}", path, content),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                    }
+                    Err(e) => {
+                        let log_event = SwarmEvent::AgentLog {
+                            agent_id: agent_id.to_string(),
+                            content: format!("Error reading file {}: {}", path, e),
+                        };
+                        let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                        return Err(e.to_string());
+                    }
+                }
+            }
+            AssistantAction::RunCommand { command } => {
+                let log_start = SwarmEvent::AgentLog {
+                    agent_id: agent_id.to_string(),
+                    content: format!("Running command: {}", command),
+                };
+                let _ = channel.send(serde_json::to_string(&log_start).unwrap());
+
+                let parsed = parse_command_string(&command);
+                if let Some((program, args)) = parsed {
+                    let (proc_tx, mut proc_rx) = tokio::sync::mpsc::channel(100);
+                    let channel_clone = channel.clone();
+                    let agent_id_str = agent_id.to_string();
+                    let log_forwarder = tokio::spawn(async move {
+                        while let Some(line) = proc_rx.recv().await {
+                            let event = SwarmEvent::AgentLog {
+                                agent_id: agent_id_str.clone(),
+                                content: line,
+                            };
+                            if let Ok(serialized) = serde_json::to_string(&event) {
+                                let _ = channel_clone.send(serialized);
+                            }
+                        }
+                    });
+
+                    let run_res = run_process_and_stream(&program, &args, workspace, proc_tx).await;
+                    let _ = log_forwarder.await;
+
+                    match run_res {
+                        Ok((exit_code, _)) => {
+                            let log_event = SwarmEvent::AgentLog {
+                                agent_id: agent_id.to_string(),
+                                content: format!("Process exited with status code: {}", exit_code),
+                            };
+                            let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                            if exit_code != 0 {
+                                return Err(format!("Process failed with exit code: {}", exit_code));
+                            }
+                        }
+                        Err(e) => {
+                            let log_event = SwarmEvent::AgentLog {
+                                agent_id: agent_id.to_string(),
+                                content: format!("Error running process: {}", e),
+                            };
+                            let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    let log_event = SwarmEvent::AgentLog {
+                        agent_id: agent_id.to_string(),
+                        content: "Invalid command string".to_string(),
+                    };
+                    let _ = channel.send(serde_json::to_string(&log_event).unwrap());
+                    return Err("Invalid command string".to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn run_agent_task(
+    agent_id: &str,
+    role: &str,
+    task_description: &str,
+    workspace: &str,
+    provider: &str,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    api_key: &crate::security::ObfBox,
+    channel: &tauri::ipc::Channel<String>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let system_prompt = format!(
+        "You are the specialized {} Agent in Antigravity's Multi-Agent Swarm.\n\
+        Your specific task to complete is: \"{}\"\n\
+        Your workspace is located at: {}.\n\n\
+        You have access to the local filesystem. To perform actions, you must output code blocks:\n\
+        - Write file:\n\
+        ```write-file path=\"relative/path/to/file\"\n\
+        content\n\
+        ```\n\
+        - Read file:\n\
+        ```read-file path=\"relative/path/to/file\"\n\
+        ```\n\
+        - Run terminal command:\n\
+        ```run-command\n\
+        command\n\
+        ```\n\n\
+        Fulfill your assigned task now. Be extremely precise and complete. Explain what actions you did.",
+        role, task_description, workspace
+    );
+
+    let (api_tx, mut api_rx) = tokio::sync::mpsc::channel(100);
+    let provider_str = provider.to_string();
+    let endpoint_str = endpoint.map(|s| s.to_string());
+    let model_str = model.map(|s| s.to_string());
+    let api_key_clone = api_key.clone();
+    let channel_clone = channel.clone();
+    let agent_id_str = agent_id.to_string();
+    let app_handle_clone = app_handle.clone();
+
+    tokio::spawn(async move {
+        let _ = crate::inference::stream_generate_content_multiplexed(
+            &provider_str,
+            endpoint_str.as_deref(),
+            model_str.as_deref(),
+            &api_key_clone,
+            &system_prompt,
+            None,
+            api_tx,
+            Some(app_handle_clone),
+        )
+        .await;
+    });
+
+    let mut full_response = String::new();
+    while let Some(token) = api_rx.recv().await {
+        full_response.push_str(&token);
+        let token_event = SwarmEvent::AgentToken {
+            agent_id: agent_id_str.clone(),
+            token,
+        };
+        if let Ok(serialized) = serde_json::to_string(&token_event) {
+            let _ = channel_clone.send(serialized);
+        }
+    }
+
+    let actions = parse_actions(&full_response);
+    if !actions.is_empty() {
+        execute_swarm_agent_actions(actions, agent_id, workspace, channel).await?;
+    }
+    
+    Ok(())
+}
+
+#[tauri::command]
+async fn run_swarm_orchestrator(
+    prompt: String,
+    channel: tauri::ipc::Channel<String>,
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let workspace = {
+        let ws = state.workspace_root.lock().unwrap();
+        ws.clone()
+    };
+
+    let provider = {
+        let p = state.llm_provider.lock().unwrap();
+        p.clone()
+    };
+
+    let endpoint = {
+        let e = state.llm_endpoint.lock().unwrap();
+        e.clone()
+    };
+
+    let model = {
+        let m = state.llm_model.lock().unwrap();
+        m.clone()
+    };
+
+    let api_key_obf = {
+        let key = state.api_token.lock().unwrap();
+        key.clone()
+    };
+
+    let final_api_key = match api_key_obf {
+        Some(obf) => obf,
+        None => {
+            let key_name = if provider == "openai" {
+                "openai_api_key"
+            } else {
+                "gemini_api_key"
+            };
+            if let Ok(obf) = crate::security::load_secure_token(key_name) {
+                obf
+            } else {
+                let env_name = if provider == "openai" {
+                    "OPENAI_API_KEY"
+                } else {
+                    "GEMINI_API_KEY"
+                };
+                if let Ok(env_key) = std::env::var(env_name) {
+                    crate::security::ObfBox::new(env_key.as_bytes())
+                } else {
+                    return Err(format!(
+                        "API Key is not configured for provider '{}'. Please configure one in Settings.",
+                        provider
+                    ));
+                }
+            }
+        }
+    };
+
+    let planner_prompt = format!(
+        "You are the central Swarm Planner for Antigravity, an advanced multi-agent development system.\n\
+        The user wants to accomplish the following goal in the local workspace: \"{}\".\n\
+        The workspace path is: {}.\n\n\
+        Your job is to break down this goal into a list of tasks that can be executed by specialized agents.\n\
+        The available agents are:\n\
+        - Architect (creates structures, file layouts, empty templates)\n\
+        - Frontend (implements React, styles, CSS, assets, web UIs)\n\
+        - Backend (implements server logic, APIs, Rust, SQLite databases)\n\
+        - QA (runs linter, runs compiler checks, verifies files and heals)\n\n\
+        Output a valid JSON array of tasks matching this schema (with status set to pending):\n\
+        [\n\
+          {{\n\
+            \"id\": \"task_1\",\n\
+            \"agent_id\": \"architect_1\",\n\
+            \"role\": \"Architect\",\n\
+            \"description\": \"Write design template and folder layout for the project.\",\n\
+            \"dependencies\": []\n\
+          }},\n\
+          {{\n\
+            \"id\": \"task_2\",\n\
+            \"agent_id\": \"frontend_1\",\n\
+            \"role\": \"Frontend\",\n\
+            \"description\": \"Write UI components in src/App.tsx.\",\n\
+            \"dependencies\": [\"task_1\"]\n\
+          }}\n\
+        ]\n\n\
+        Important rules:\n\
+        - Specify dependencies clearly. A task can only start once all its dependent task IDs are completed.\n\
+        - Do not include markdown wraps (like ```json), just output the raw JSON text.",
+        prompt, workspace
+    );
+
+    let (api_tx, mut api_rx) = tokio::sync::mpsc::channel(100);
+    let provider_clone = provider.clone();
+    let endpoint_clone = endpoint.clone();
+    let model_clone = model.clone();
+    let final_api_key_clone = final_api_key.clone();
+    let app_handle_clone = app_handle.clone();
+    let planner_prompt_clone = planner_prompt.clone();
+
+    tokio::spawn(async move {
+        let _ = crate::inference::stream_generate_content_multiplexed(
+            &provider_clone,
+            endpoint_clone.as_deref(),
+            model_clone.as_deref(),
+            &final_api_key_clone,
+            &planner_prompt_clone,
+            None,
+            api_tx,
+            Some(app_handle_clone),
+        )
+        .await;
+    });
+
+    let mut planner_res = String::new();
+    while let Some(token) = api_rx.recv().await {
+        planner_res.push_str(&token);
+    }
+    
+    let cleaned_res = clean_json_response(&planner_res);
+    let mut tasks: Vec<SwarmTask> = match serde_json::from_str(&cleaned_res) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Swarm Planner returned invalid JSON: {}, fallback to basic plan", e);
+            vec![
+                SwarmTask {
+                    id: "task_1".to_string(),
+                    agent_id: "architect_1".to_string(),
+                    role: "Architect".to_string(),
+                    description: format!("Decompose and prepare basic files for goal: {}", prompt),
+                    dependencies: vec![],
+                    status: "pending".to_string(),
+                },
+                SwarmTask {
+                    id: "task_2".to_string(),
+                    agent_id: "qa_1".to_string(),
+                    role: "QA".to_string(),
+                    description: "Verify that all changes are compiling and correct.".to_string(),
+                    dependencies: vec!["task_1".to_string()],
+                    status: "pending".to_string(),
+                }
+            ]
+        }
+    };
+
+    for task in &mut tasks {
+        task.status = "pending".to_string();
+    }
+
+    let start_event = SwarmEvent::SwarmStart { plan: tasks.clone() };
+    let _ = channel.send(serde_json::to_string(&start_event).unwrap());
+
+    let tasks_state = std::sync::Arc::new(tokio::sync::Mutex::new(tasks));
+    let mut swarm_success = true;
+
+    loop {
+        let mut active_futures = Vec::new();
+        
+        {
+            let mut tasks_lock = tasks_state.lock().await;
+            
+            let all_done = tasks_lock.iter().all(|t| t.status == "completed");
+            let any_failed = tasks_lock.iter().any(|t| t.status == "failed");
+            
+            if any_failed {
+                swarm_success = false;
+                break;
+            }
+            if all_done {
+                break;
+            }
+            
+            let completed_ids: std::collections::HashSet<String> = tasks_lock
+                .iter()
+                .filter(|t| t.status == "completed")
+                .map(|t| t.id.clone())
+                .collect();
+
+            for task in tasks_lock.iter_mut() {
+                if task.status == "pending" {
+                    let deps_satisfied = task.dependencies.iter().all(|dep_id| {
+                        completed_ids.contains(dep_id)
+                    });
+                    
+                    if deps_satisfied {
+                        task.status = "running".to_string();
+                        let status_event = SwarmEvent::AgentStatus {
+                            agent_id: task.agent_id.clone(),
+                            role: task.role.clone(),
+                            status: "running".to_string(),
+                            current_task: task.description.clone(),
+                        };
+                        let _ = channel.send(serde_json::to_string(&status_event).unwrap());
+                        
+                        let task_id = task.id.clone();
+                        let agent_id = task.agent_id.clone();
+                        let role = task.role.clone();
+                        let desc = task.description.clone();
+                        
+                        let workspace_clone = workspace.clone();
+                        let provider_clone = provider.clone();
+                        let endpoint_clone = endpoint.clone();
+                        let model_clone = model.clone();
+                        let api_key_clone = final_api_key.clone();
+                        let channel_clone = channel.clone();
+                        let tasks_state_clone = tasks_state.clone();
+                        let app_handle_clone = app_handle.clone();
+                        
+                        let fut = tokio::spawn(async move {
+                            let res = run_agent_task(
+                                &agent_id,
+                                &role,
+                                &desc,
+                                &workspace_clone,
+                                &provider_clone,
+                                endpoint_clone.as_deref(),
+                                model_clone.as_deref(),
+                                &api_key_clone,
+                                &channel_clone,
+                                app_handle_clone,
+                            ).await;
+                            
+                            let mut tasks_lock_inner = tasks_state_clone.lock().await;
+                            if let Some(t) = tasks_lock_inner.iter_mut().find(|t| t.id == task_id) {
+                                if res.is_ok() {
+                                    t.status = "completed".to_string();
+                                } else {
+                                    t.status = "failed".to_string();
+                                }
+                                let status_event = SwarmEvent::AgentStatus {
+                                    agent_id: agent_id.clone(),
+                                    role: role.clone(),
+                                    status: t.status.clone(),
+                                    current_task: desc.clone(),
+                                };
+                                let _ = channel_clone.send(serde_json::to_string(&status_event).unwrap());
+                            }
+                        });
+                        active_futures.push(fut);
+                    }
+                }
+            }
+        }
+        
+        if active_futures.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        } else {
+            for fut in active_futures {
+                let _ = fut.await;
+            }
+        }
+    }
+
+    let end_event = SwarmEvent::SwarmEnd { success: swarm_success };
+    let _ = channel.send(serde_json::to_string(&end_event).unwrap());
+    Ok(())
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(AppState::default())
@@ -3221,7 +4131,9 @@ fn main() {
             sniff_file_type,
             extract_document_text,
             upload_file_to_gemini,
-            open_file_dialog
+            open_file_dialog,
+            run_chat_assistant,
+            run_swarm_orchestrator
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

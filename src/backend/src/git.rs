@@ -12,7 +12,7 @@ pub fn is_git_repo(path: &str) -> bool {
     Repository::discover(path).is_ok()
 }
 
-fn open_repo(path: &str) -> Result<Repository, String> {
+pub(crate) fn open_repo(path: &str) -> Result<Repository, String> {
     Repository::discover(path)
         .map_err(|e| format!("Failed to discover repository for path '{}': {}", path, e))
 }

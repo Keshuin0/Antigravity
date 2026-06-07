@@ -130,7 +130,33 @@ const parseAnsi = (text: string): React.ReactNode => {
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 
 type SidebarTab = 'explorer' | 'search' | 'settings' | 'git';
-type ConsoleTab = 'healer' | 'logs';
+type ConsoleTab = 'healer' | 'logs' | 'assistant';
+
+const renderMarkdown = (text: string) => {
+  const parts = text.split(/(```[\s\S]*?```)/g);
+  return parts.map((part, idx) => {
+    if (part.startsWith('```')) {
+      const match = part.match(/```(\w*)\n([\s\S]*?)```/);
+      const code = match ? match[2] : part.slice(3, -3);
+      return (
+        <pre key={idx} className="bg-black/50 border border-white/5 p-3 rounded-md my-2 overflow-x-auto text-[11px] font-mono text-neutral-300">
+          <code className="text-primary">{code}</code>
+        </pre>
+      );
+    }
+    const lineParts = part.split('\n').map((line, lIdx) => {
+      const boldParts = line.split(/(\*\*.*?\*\*)/g);
+      const lineContent = boldParts.map((bp, bpIdx) => {
+        if (bp.startsWith('**') && bp.endsWith('**')) {
+          return <strong key={bpIdx} className="text-white font-bold">{bp.slice(2, -2)}</strong>;
+        }
+        return bp;
+      });
+      return <div key={lIdx}>{lineContent}</div>;
+    });
+    return <span key={idx}>{lineParts}</span>;
+  });
+};
 
 const App: React.FC = () => {
   // Navigation & UI Layout Tabs
@@ -224,6 +250,38 @@ const App: React.FC = () => {
   const [hasSecretsInStaged, setHasSecretsInStaged] = useState<boolean>(false);
   const [isGeneratingCommit, setIsGeneratingCommit] = useState<boolean>(false);
   const [isPushing, setIsPushing] = useState<boolean>(false);
+
+  // AI Chat Assistant & Swarm Orchestrator States
+  const [chatMessages, setChatMessages] = useState<Array<{
+    role: 'user' | 'assistant';
+    content: string;
+    actions?: Array<{
+      action: string;
+      detail: string;
+      logs: string[];
+      success?: boolean;
+    }>;
+  }>>([
+    {
+      role: 'assistant',
+      content: 'Welcome to the Antigravity AI Assistant! You can ask me to perform coding tasks, compile code, read/write files, or run command line tools. Toggle Swarm Mode to execute complex multi-agent pipelines.',
+    }
+  ]);
+  const [chatInput, setChatInput] = useState<string>('');
+  const [chatStatus, setChatStatus] = useState<'idle' | 'streaming' | 'executing' | 'error'>('idle');
+  const [swarmMode, setSwarmMode] = useState<boolean>(false);
+  const [swarmTasks, setSwarmTasks] = useState<Array<{
+    id: string;
+    agent_id: string;
+    role: string;
+    description: string;
+    dependencies: string[];
+    status: string;
+  }>>([]);
+  const [agentLogs, setAgentLogs] = useState<Record<string, string[]>>({});
+  const [agentTokens, setAgentTokens] = useState<Record<string, string>>({});
+  const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+  const chatMessagesEndRef = useRef<HTMLDivElement | null>(null);
 
   const loadGitStatus = useCallback(async () => {
     if (!isTauri) return;
@@ -805,6 +863,215 @@ const App: React.FC = () => {
       loadSymbols();
     }
   };
+
+  // Submit AI Chat Assistant / Swarm Orchestration
+  const handleChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!chatInput.trim()) return;
+
+    const currentInput = chatInput;
+    setChatInput('');
+    setChatStatus('streaming');
+
+    setChatMessages((prev) => [
+      ...prev,
+      { role: 'user', content: currentInput },
+      { role: 'assistant', content: '', actions: [] }
+    ]);
+
+    if (!isTauri) {
+      setTimeout(() => {
+        setChatMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last) {
+            last.content = `[Browser Mock] Received your message: "${currentInput}". To run actual AI execution and Swarm pipelines, please run this inside the Tauri native app wrapper!`;
+          }
+          return next;
+        });
+        setChatStatus('idle');
+      }, 1000);
+      return;
+    }
+
+    if (swarmMode) {
+      setSwarmTasks([]);
+      setAgentLogs({});
+      setAgentTokens({});
+      setSelectedAgentId(null);
+
+      const channel = new Channel<string>();
+      channel.onmessage = (messageStr) => {
+        try {
+          const event = JSON.parse(messageStr);
+          if (event.type === 'swarm_start') {
+            setSwarmTasks(event.plan);
+            const initialLogs: Record<string, string[]> = {};
+            const initialTokens: Record<string, string> = {};
+            event.plan.forEach((t: { agent_id: string }) => {
+              initialLogs[t.agent_id] = [];
+              initialTokens[t.agent_id] = '';
+            });
+            setAgentLogs(initialLogs);
+            setAgentTokens(initialTokens);
+          } else if (event.type === 'agent_status') {
+            setSwarmTasks((prev) =>
+              prev.map((t) =>
+                t.agent_id === event.agent_id
+                  ? { ...t, status: event.status, description: event.current_task }
+                  : t
+              )
+            );
+          } else if (event.type === 'agent_token') {
+            setAgentTokens((prev) => ({
+              ...prev,
+              [event.agent_id]: (prev[event.agent_id] || '') + event.token,
+            }));
+          } else if (event.type === 'agent_log') {
+            setAgentLogs((prev) => ({
+              ...prev,
+              [event.agent_id]: [...(prev[event.agent_id] || []), event.content],
+            }));
+          } else if (event.type === 'swarm_end') {
+            setChatStatus(event.success ? 'idle' : 'error');
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last) {
+                last.content = event.success
+                  ? `### Swarm Execution Successful! 🎉\n\nAll tasks in the multi-agent dependency plan completed cleanly.`
+                  : `### Swarm Execution Failed ❌\n\nOne or more agents failed to compile or complete their tasks. Check logs for details.`;
+              }
+              return next;
+            });
+            playSuccess();
+          }
+        } catch (e) {
+          console.error("Failed parsing swarm event", e);
+        }
+      };
+
+      try {
+        await invoke('run_swarm_orchestrator', {
+          prompt: currentInput,
+          channel,
+        });
+      } catch (err) {
+        console.error("Swarm orchestrator runtime error", err);
+        setChatStatus('error');
+        setChatMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last) {
+            last.content = `### Swarm Aborted ❌\n\nAn unexpected error occurred during execution: ${err}`;
+          }
+          return next;
+        });
+        playError();
+      }
+    } else {
+      const channel = new Channel<string>();
+      const history = chatMessages
+        .slice(-10)
+        .map((m) => ({ role: m.role, content: m.content }));
+
+      channel.onmessage = (messageStr) => {
+        try {
+          const event = JSON.parse(messageStr);
+          if (event.type === 'token') {
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'assistant') {
+                last.content += event.content;
+              }
+              return next;
+            });
+          } else if (event.type === 'action_start') {
+            setChatStatus('executing');
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'assistant') {
+                if (!last.actions) last.actions = [];
+                last.actions.push({
+                  action: event.action,
+                  detail: event.detail,
+                  logs: [],
+                });
+              }
+              return next;
+            });
+          } else if (event.type === 'action_log') {
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'assistant' && last.actions && last.actions.length > 0) {
+                const lastAction = last.actions[last.actions.length - 1];
+                if (lastAction) {
+                  lastAction.logs.push(event.content);
+                }
+              }
+              return next;
+            });
+          } else if (event.type === 'action_end') {
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'assistant' && last.actions && last.actions.length > 0) {
+                const lastAction = last.actions[last.actions.length - 1];
+                if (lastAction) {
+                  lastAction.success = event.success;
+                  if (event.detail) lastAction.detail = event.detail;
+                }
+              }
+              return next;
+            });
+          } else if (event.type === 'error') {
+            setChatStatus('error');
+            setChatMessages((prev) => {
+              const next = [...prev];
+              const last = next[next.length - 1];
+              if (last && last.role === 'assistant') {
+                last.content += `\n\n**Execution Error:** ${event.message}`;
+              }
+              return next;
+            });
+            playError();
+          }
+        } catch (e) {
+          console.error("Failed parsing assistant event", e);
+        }
+      };
+
+      try {
+        await invoke('run_chat_assistant', {
+          prompt: currentInput,
+          history,
+          channel,
+        });
+        setChatStatus('idle');
+        playSuccess();
+      } catch (err) {
+        console.error("Assistant execution error", err);
+        setChatStatus('error');
+        setChatMessages((prev) => {
+          const next = [...prev];
+          const last = next[next.length - 1];
+          if (last && last.role === 'assistant') {
+            last.content += `\n\n**Aborted:** Failed to run assistant: ${err}`;
+          }
+          return next;
+        });
+        playError();
+      }
+    }
+    loadSymbols();
+  };
+
+  useEffect(() => {
+    chatMessagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [chatMessages, swarmTasks, agentLogs]);
 
   // Handle file attachment
   const handleFileAttach = useCallback(async (filePath: string) => {
@@ -2217,6 +2484,19 @@ const App: React.FC = () => {
                   >
                     Kernel Log Stream
                   </button>
+                  <button
+                    onClick={() => {
+                      setActiveConsoleTab('assistant');
+                      setConsoleCollapsed(false);
+                    }}
+                    className={`text-xs font-bold font-mono uppercase tracking-wider transition-colors py-1 ${
+                      activeConsoleTab === 'assistant' && !consoleCollapsed
+                        ? 'text-primary border-b-2 border-primary'
+                        : 'text-neutral-400 hover:text-white'
+                    }`}
+                  >
+                    AI Chat Assistant
+                  </button>
                 </div>
 
                 <div className="flex items-center space-x-3">
@@ -2325,7 +2605,7 @@ const App: React.FC = () => {
                           ))}
                       </div>
                     </div>
-                  ) : (
+                  ) : activeConsoleTab === 'logs' ? (
                     /* Logs tab */
                     <div className="flex-1 p-4 overflow-y-auto space-y-2 text-[10px] leading-relaxed custom-scrollbar bg-[#05070a]/90 font-mono">
                       {logs.map((log) => (
@@ -2352,6 +2632,217 @@ const App: React.FC = () => {
                         </div>
                       ))}
                       <div ref={logEndRef} />
+                    </div>
+                  ) : (
+                    /* AI Chat Assistant tab */
+                    <div className="flex-1 flex min-h-0 bg-[#05070a]/95 text-neutral-300">
+                      {/* Left Side: Chat Interface */}
+                      <div className="flex-1 flex flex-col min-w-0 border-r border-white/5 p-4 space-y-3">
+                        {/* Chat History */}
+                        <div className="flex-1 overflow-y-auto space-y-4 pr-2 custom-scrollbar">
+                          {chatMessages.map((msg, index) => (
+                            <div
+                              key={index}
+                              className={`flex flex-col space-y-1.5 max-w-[85%] ${
+                                msg.role === 'user' ? 'ml-auto items-end' : 'mr-auto items-start'
+                              }`}
+                            >
+                              <div className="flex items-center space-x-2">
+                                <span className={`text-[9px] uppercase tracking-widest font-mono font-bold ${
+                                  msg.role === 'user' ? 'text-primary' : 'text-accent'
+                                }`}>
+                                  {msg.role === 'user' ? '👤 User' : '🤖 Antigravity OS'}
+                                </span>
+                              </div>
+                              <div
+                                className={`px-4 py-2.5 rounded-xl text-xs leading-relaxed ${
+                                  msg.role === 'user'
+                                    ? 'bg-primary/10 border border-primary/20 text-white rounded-br-none shadow-md shadow-primary/5'
+                                    : 'bg-white/5 border border-white/10 text-neutral-200 rounded-bl-none shadow-md shadow-black/30'
+                                }`}
+                              >
+                                <div className="whitespace-pre-wrap font-mono">
+                                  {renderMarkdown(msg.content)}
+                                </div>
+
+                                {msg.actions && msg.actions.length > 0 && (
+                                  <div className="mt-3 space-y-2 pt-2.5 border-t border-white/5 font-mono">
+                                    {msg.actions.map((act, aIdx) => (
+                                      <div key={aIdx} className="bg-black/30 border border-white/5 rounded-lg overflow-hidden text-[10px]">
+                                        <div className="flex items-center justify-between px-3 py-1.5 bg-white/5">
+                                          <span className="flex items-center space-x-1.5">
+                                            <span>{act.action === 'run-command' ? '💻' : '📝'}</span>
+                                            <span className="font-bold text-neutral-300">{act.detail}</span>
+                                          </span>
+                                          <span className={`px-1.5 py-0.2 rounded-[4px] font-bold text-[8px] uppercase tracking-wider ${
+                                            act.success === undefined
+                                              ? 'bg-amber-500/10 text-amber-400 animate-pulse'
+                                              : act.success
+                                                ? 'bg-emerald-500/10 text-emerald-400'
+                                                : 'bg-rose-500/10 text-rose-400'
+                                          }`}>
+                                            {act.success === undefined ? 'Running' : act.success ? 'Success' : 'Failed'}
+                                          </span>
+                                        </div>
+                                        {act.logs.length > 0 && (
+                                          <pre className="p-2.5 max-h-[120px] overflow-y-auto text-[9px] text-neutral-400 bg-black/40 custom-scrollbar whitespace-pre-wrap leading-tight">
+                                            {act.logs.join('\n')}
+                                          </pre>
+                                        )}
+                                      </div>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                          <div ref={chatMessagesEndRef} />
+                        </div>
+
+                        {/* Input Area */}
+                        <form onSubmit={handleChatSubmit} className="flex space-x-3 items-center flex-shrink-0 border-t border-white/5 pt-3">
+                          <button
+                            type="button"
+                            onClick={() => setSwarmMode(!swarmMode)}
+                            className={`px-3 py-1.5 border rounded-lg text-[10px] font-bold font-mono tracking-wider transition-all cursor-pointer flex items-center space-x-1.5 ${
+                              swarmMode
+                                ? 'bg-primary/20 border-primary text-primary shadow-lg shadow-primary/10'
+                                : 'bg-white/5 border-white/10 text-neutral-400 hover:text-white hover:bg-white/10'
+                            }`}
+                            title="Toggle multi-agent parallel execution swarm mode"
+                          >
+                            <span>🌀</span>
+                            <span>{swarmMode ? 'Swarm Mode Active' : 'Single Agent'}</span>
+                          </button>
+
+                          <input
+                            type="text"
+                            value={chatInput}
+                            onChange={(e) => setChatInput(e.target.value)}
+                            disabled={chatStatus === 'streaming' || chatStatus === 'executing'}
+                            placeholder={
+                              swarmMode
+                                ? "Give a high-level task to deploy the multi-agent swarm..."
+                                : "Ask me anything (e.g. 'read config.json', 'create notes.txt')"
+                            }
+                            className="flex-1 px-4 py-2 bg-black/40 border border-white/10 focus:border-primary/40 outline-none rounded-lg text-xs text-white font-mono"
+                          />
+                          <button
+                            type="submit"
+                            disabled={!chatInput.trim() || chatStatus === 'streaming' || chatStatus === 'executing'}
+                            className="px-5 py-2 bg-gradient-to-tr from-primary to-accent hover:from-primary hover:to-accent disabled:opacity-50 text-white rounded-lg text-xs font-semibold font-mono tracking-wider active:scale-95 transition-all cursor-pointer shadow-md shadow-primary/10"
+                          >
+                            {chatStatus === 'streaming'
+                              ? 'STREAMS...'
+                              : chatStatus === 'executing'
+                                ? 'RUNNING...'
+                                : 'EXECUTE'}
+                          </button>
+                        </form>
+                      </div>
+
+                      {swarmMode && (
+                        <div className="w-[320px] flex flex-col min-w-0 p-4 bg-black/20 overflow-hidden">
+                          <div className="flex items-center justify-between border-b border-white/5 pb-2 mb-3">
+                            <span className="text-xs font-bold font-mono uppercase tracking-wider text-primary">
+                              🌀 Swarm Orchestrator Graph
+                            </span>
+                            <span className="text-[9px] font-mono text-neutral-500">
+                              Active Agents: {swarmTasks.filter((t) => t.status === 'running').length}
+                            </span>
+                          </div>
+
+                          {swarmTasks.length === 0 ? (
+                            <div className="flex-1 flex flex-col items-center justify-center text-center p-4 border border-dashed border-white/5 rounded-xl bg-black/10">
+                              <span className="text-xl mb-2">💤</span>
+                              <p className="text-[10px] text-neutral-500 font-mono">
+                                Swarm idle. Enter a task to construct the dependency graph and deploy parallel agents.
+                              </p>
+                            </div>
+                          ) : (
+                            <div className="flex-1 flex flex-col min-h-0 space-y-4 overflow-y-auto pr-1 custom-scrollbar">
+                              <div className="grid grid-cols-1 gap-2.5">
+                                {swarmTasks.map((task) => (
+                                  <div
+                                    key={task.id}
+                                    onClick={() => setSelectedAgentId(task.agent_id)}
+                                    className={`p-3 border rounded-xl cursor-pointer transition-all duration-200 bg-white/5 ${
+                                      selectedAgentId === task.agent_id
+                                        ? 'border-primary shadow-md shadow-primary/5 bg-primary/5'
+                                        : 'border-white/5 hover:border-white/20 hover:bg-white/10'
+                                    }`}
+                                  >
+                                    <div className="flex items-center justify-between mb-1.5">
+                                      <div className="flex items-center space-x-1.5">
+                                        <span className={`w-2 h-2 rounded-full ${
+                                          task.role === 'Architect'
+                                            ? 'bg-cyan-400'
+                                            : task.role === 'Frontend'
+                                              ? 'bg-violet-400'
+                                              : task.role === 'Backend'
+                                                ? 'bg-emerald-400'
+                                                : 'bg-amber-400'
+                                        }`} />
+                                        <span className="text-[10px] font-bold font-mono uppercase text-white">
+                                          {task.role} Agent
+                                        </span>
+                                      </div>
+                                      <span className={`px-1.5 py-0.2 rounded-[4px] font-bold text-[8px] uppercase tracking-wider ${
+                                        task.status === 'completed'
+                                          ? 'bg-emerald-500/10 text-emerald-400'
+                                          : task.status === 'failed'
+                                            ? 'bg-rose-500/10 text-rose-400'
+                                            : task.status === 'running'
+                                              ? 'bg-cyan-500/10 text-cyan-400 animate-pulse border border-cyan-500/25'
+                                              : 'bg-white/5 text-neutral-500'
+                                      }`}>
+                                        {task.status}
+                                      </span>
+                                    </div>
+                                    <p className="text-[9px] text-neutral-400 font-mono leading-relaxed line-clamp-2">
+                                      {task.description}
+                                    </p>
+                                    
+                                    {agentTokens[task.agent_id] && task.status === 'running' && (
+                                      <div className="mt-2 p-1.5 bg-black/40 border border-white/5 rounded-md text-[8px] font-mono text-cyan-300 animate-pulse overflow-hidden text-ellipsis whitespace-nowrap">
+                                        💭 {agentTokens[task.agent_id]}
+                                      </div>
+                                    )}
+                                  </div>
+                                ))}
+                              </div>
+
+                              {selectedAgentId && (
+                                <div className="flex-1 flex flex-col min-h-[150px] border border-white/10 rounded-xl overflow-hidden bg-black/50 font-mono text-[9px] shadow-lg shadow-black/50">
+                                  <div className="flex items-center justify-between px-3 py-1.5 bg-white/5 border-b border-white/5">
+                                    <span className="text-white/60 font-semibold font-mono uppercase">
+                                      🖥️ Logs: {selectedAgentId}
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={() => setSelectedAgentId(null)}
+                                      className="text-neutral-500 hover:text-white cursor-pointer"
+                                    >
+                                      &times;
+                                    </button>
+                                  </div>
+                                  <div className="flex-1 p-2.5 overflow-y-auto leading-relaxed custom-scrollbar whitespace-pre-wrap text-neutral-300">
+                                    {agentLogs[selectedAgentId] && agentLogs[selectedAgentId].length > 0 ? (
+                                      agentLogs[selectedAgentId].map((line, lIdx) => (
+                                        <div key={lIdx} className="border-b border-white/5 pb-0.5 mb-1.5 last:border-0 last:pb-0 last:mb-0">
+                                          {line}
+                                        </div>
+                                      ))
+                                    ) : (
+                                      <span className="text-neutral-600 italic">No execution logs outputted yet.</span>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>
