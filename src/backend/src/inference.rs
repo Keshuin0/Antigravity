@@ -290,7 +290,9 @@ pub async fn stream_generate_content_multiplexed(
             .await
             .map_err(|e| format!("Network request failed: {}", e))?
     } else {
-        let mut endpoint_url = endpoint.unwrap_or("http://localhost:8000/v1/chat/completions").to_string();
+        let mut endpoint_url = endpoint
+            .unwrap_or("http://localhost:8000/v1/chat/completions")
+            .to_string();
         if !endpoint_url.ends_with("/chat/completions") && !endpoint_url.ends_with("/completions") {
             if endpoint_url.ends_with('/') {
                 endpoint_url.push_str("chat/completions");
@@ -508,9 +510,11 @@ mod tests {
     async fn test_live_gemini_connection() {
         let service = "com.antigravity.workspace";
         let keyring_entry = keyring::Entry::new(service, "gemini_api_key").unwrap();
-        let key = keyring_entry.get_password().expect("Gemini API key not found in keyring");
+        let key = keyring_entry
+            .get_password()
+            .expect("Gemini API key not found in keyring");
         let obf = crate::security::ObfBox::new(key.as_bytes());
-        
+
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
         let handle = tokio::spawn(async move {
             stream_generate_content_multiplexed(
@@ -525,12 +529,12 @@ mod tests {
             )
             .await
         });
-        
+
         let mut response = String::new();
         while let Some(msg) = rx.recv().await {
             response.push_str(&msg);
         }
-        
+
         let res = handle.await.unwrap();
         assert!(res.is_ok(), "Gemini stream returned error: {:?}", res);
         println!("Gemini response: {}", response);
