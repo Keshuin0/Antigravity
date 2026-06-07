@@ -27,7 +27,7 @@ fn resolve_rust_analyzer_path() -> PathBuf {
     PathBuf::from("rust-analyzer")
 }
 
-fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+fn resolve_typescript_server_path(_app_handle: &AppHandle) -> Result<PathBuf, String> {
     let bin_name = if cfg!(target_os = "windows") {
         "typescript-language-server.cmd"
     } else {
@@ -49,11 +49,7 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     }
 
     // Auto-install TS Server locally
-    {
-        let state = app_handle.state::<crate::AppState>();
-        let mut logs = state.logs.lock().unwrap();
-        logs.push("LSP [typescript]: typescript-language-server not found in PATH. Initiating automatic local installation...".to_string());
-    }
+    tracing::info!("LSP [typescript]: typescript-language-server not found in PATH. Initiating automatic local installation...");
 
     let _ = std::fs::create_dir_all(&local_servers_dir);
     let npm_bin = if cfg!(target_os = "windows") {
@@ -85,11 +81,7 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
         .map_err(|e| format!("Failed to wait for npm installer: {}", e))?;
 
     if status.success() && local_bin_path.exists() {
-        let state = app_handle.state::<crate::AppState>();
-        let mut logs = state.logs.lock().unwrap();
-        logs.push(
-            "LSP [typescript]: Automatic local installation completed successfully.".to_string(),
-        );
+        tracing::info!("LSP [typescript]: Automatic local installation completed successfully.");
         Ok(local_bin_path)
     } else {
         Err(format!(
@@ -231,14 +223,12 @@ impl LspClient {
             .stderr(std::process::Stdio::piped());
 
         // log startup attempt
-        {
-            let state = app_handle.state::<crate::AppState>();
-            let mut logs = state.logs.lock().unwrap();
-            logs.push(format!(
-                "LSP [{}]: Spawning language server '{}' with args {:?}",
-                language, program, args
-            ));
-        }
+        tracing::info!(
+            "LSP [{}]: Spawning language server '{}' with args {:?}",
+            language,
+            program,
+            args
+        );
 
         let mut child = cmd
             .spawn()
@@ -253,12 +243,7 @@ impl LspClient {
                 Some(job)
             }
             Err(e) => {
-                let state = app_handle.state::<crate::AppState>();
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!(
-                    "LSP warning: failed to create process sandbox: {}",
-                    e
-                ));
+                tracing::warn!("LSP warning: failed to create process sandbox: {}", e);
                 None
             }
         };
@@ -283,15 +268,11 @@ impl LspClient {
         });
 
         // 2. Spawn Stderr Logger Task
-        let app_handle_err = app_handle.clone();
         let lang_name_err = language.to_string();
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let msg = format!("LSP [{}] stderr: {}", lang_name_err, line);
-                let state = app_handle_err.state::<crate::AppState>();
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(msg);
+                tracing::info!("LSP [{}] stderr: {}", lang_name_err, line);
             }
         });
 
@@ -326,9 +307,7 @@ impl LspClient {
                             }
                         }
                         Err(e) => {
-                            let state = app_handle_out.state::<crate::AppState>();
-                            let mut logs = state.logs.lock().unwrap();
-                            logs.push(format!("LSP [{}] reader read error: {}", lang_name_out, e));
+                            tracing::error!("LSP [{}] reader read error: {}", lang_name_out, e);
                             return;
                         }
                     }
@@ -337,24 +316,17 @@ impl LspClient {
                 let length = match content_length {
                     Some(len) => len,
                     None => {
-                        let state = app_handle_out.state::<crate::AppState>();
-                        let mut logs = state.logs.lock().unwrap();
-                        logs.push(format!(
+                        tracing::error!(
                             "LSP [{}] reader error: Missing Content-Length header",
                             lang_name_out
-                        ));
+                        );
                         continue;
                     }
                 };
 
                 let mut body_bytes = vec![0u8; length];
                 if let Err(e) = reader.read_exact(&mut body_bytes).await {
-                    let state = app_handle_out.state::<crate::AppState>();
-                    let mut logs = state.logs.lock().unwrap();
-                    logs.push(format!(
-                        "LSP [{}] reader body read error: {}",
-                        lang_name_out, e
-                    ));
+                    tracing::error!("LSP [{}] reader body read error: {}", lang_name_out, e);
                     return;
                 }
 
@@ -391,7 +363,6 @@ impl LspClient {
         });
 
         // 4. Spawn Stdin Writer Task
-        let app_handle_in = app_handle.clone();
         let lang_name_in = language.to_string();
         tokio::spawn(async move {
             let mut writer = stdin;
@@ -407,9 +378,7 @@ impl LspClient {
                                         serialized
                                     );
                                     if let Err(e) = writer.write_all(payload.as_bytes()).await {
-                                        let state = app_handle_in.state::<crate::AppState>();
-                                        let mut logs = state.logs.lock().unwrap();
-                                        logs.push(format!("LSP [{}] write error: {}", lang_name_in, e));
+                                        tracing::error!("LSP [{}] write error: {}", lang_name_in, e);
                                         break;
                                     }
                                     let _ = writer.flush().await;
@@ -441,13 +410,11 @@ impl LspClient {
             if let Some(client_arc) = client_weak.upgrade() {
                 // Not gracefully shutdown, this was a crash!
                 let state = app_handle_mon.state::<crate::AppState>();
-                {
-                    let mut logs = state.logs.lock().unwrap();
-                    logs.push(format!(
-                        "LSP [{}] CRASHED with exit code {}. Spawning self-healing supervisor...",
-                        lang_name_mon, exit_code
-                    ));
-                }
+                tracing::warn!(
+                    "LSP [{}] CRASHED with exit code {}. Spawning self-healing supervisor...",
+                    lang_name_mon,
+                    exit_code
+                );
 
                 // Remove from active clients map first so start command recreates it
                 {
@@ -474,11 +441,11 @@ impl LspClient {
                         // Re-initialize server
                         let root_uri = format!("file:///{}", root_path_mon.replace('\\', "/"));
                         if let Err(e) = new_client.initialize(&root_uri).await {
-                            let mut logs = state.logs.lock().unwrap();
-                            logs.push(format!(
+                            tracing::error!(
                                 "LSP [{}] Self-Healing Re-Initialization failed: {}",
-                                lang_name_mon, e
-                            ));
+                                lang_name_mon,
+                                e
+                            );
                             return;
                         }
 
@@ -492,19 +459,18 @@ impl LspClient {
                             let _ = new_client.file_open(&path, &content).await;
                         }
 
-                        let mut logs = state.logs.lock().unwrap();
-                        logs.push(format!(
+                        tracing::info!(
                             "LSP [{}] Self-Healing recovery complete. Restored {} open document buffers.",
                             lang_name_mon,
                             client_arc.open_files.lock().unwrap().len()
-                        ));
+                        );
                     }
                     Err(e) => {
-                        let mut logs = state.logs.lock().unwrap();
-                        logs.push(format!(
+                        tracing::error!(
                             "LSP [{}] Self-Healing recovery failed to restart server: {}",
-                            lang_name_mon, e
-                        ));
+                            lang_name_mon,
+                            e
+                        );
                     }
                 }
             }

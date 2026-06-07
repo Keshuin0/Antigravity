@@ -93,9 +93,7 @@ pub fn start_watching(
                             }
                         }
                         Some(Err(e)) => {
-                            let state = handle_clone.state::<AppState>();
-                            let mut logs = state.logs.lock().unwrap();
-                            logs.push(format!("Watcher encountered filesystem error: {}", e));
+                            tracing::error!("Watcher encountered filesystem error: {}", e);
                         }
                         None => {
                             break; // Channel closed
@@ -126,9 +124,7 @@ pub fn start_watching(
                         }
 
                         if let Err(e) = handle_debounced_changes(changes, &handle_clone, &workspace_path_buf).await {
-                            let state = handle_clone.state::<AppState>();
-                            let mut logs = state.logs.lock().unwrap();
-                            logs.push(format!("Watcher: Error handling changes: {}", e));
+                            tracing::error!("Watcher: Error handling changes: {}", e);
                         }
                     }
                 }
@@ -171,20 +167,19 @@ async fn handle_debounced_changes(
                     match cache.update_file(&path, &content) {
                         Ok(syms) => {
                             symbols_count = syms.len();
-                            let log_msg = format!(
+                            tracing::info!(
                                 "Watcher: AST parsed '{}' (found {} symbols).",
-                                rel_path, symbols_count
+                                rel_path,
+                                symbols_count
                             );
-                            let mut logs = app_state.logs.lock().unwrap();
-                            logs.push(log_msg);
                             syms
                         }
                         Err(e) => {
-                            let mut logs = app_state.logs.lock().unwrap();
-                            logs.push(format!(
+                            tracing::error!(
                                 "Watcher: Failed to update AST cache for {}: {}",
-                                rel_path, e
-                            ));
+                                rel_path,
+                                e
+                            );
                             continue;
                         }
                     }
@@ -200,7 +195,6 @@ async fn handle_debounced_changes(
                 let model = app_state.llm_model.lock().unwrap().clone();
 
                 let db_conn = app_state.db_conn.clone();
-                let logs_clone = app_state.logs.clone();
                 let app_handle_clone = app_handle.clone();
                 let path_clone = path.clone();
                 let rel_path_clone = rel_path.clone();
@@ -228,11 +222,10 @@ async fn handle_debounced_changes(
                             ) {
                                 Ok(syms) => syms,
                                 Err(e) => {
-                                    let mut logs = logs_clone.lock().unwrap();
-                                    logs.push(format!(
+                                    tracing::error!(
                                         "Watcher Database Error: Failed to upsert file: {}",
                                         e
-                                    ));
+                                    );
                                     return;
                                 }
                             }
@@ -264,11 +257,10 @@ async fn handle_debounced_changes(
                                 if let Ok(env_key) = std::env::var(env_name) {
                                     crate::security::ObfBox::new(env_key.as_bytes())
                                 } else {
-                                    let mut logs = logs_clone.lock().unwrap();
-                                    logs.push(format!(
+                                    tracing::warn!(
                                         "Watcher: Auto-indexing skipped. {} is missing.",
                                         key_name
-                                    ));
+                                    );
                                     return;
                                 }
                             }
@@ -298,23 +290,22 @@ async fn handle_debounced_changes(
                                         );
                                     }
                                 }
-                                let mut logs = logs_clone.lock().unwrap();
-                                logs.push(format!(
+                                tracing::info!(
                                     "Watcher: Successfully auto-indexed and embedded {} symbols for '{}'",
                                     symbols_to_embed.len(),
                                     rel_path_clone
-                                ));
+                                );
 
                                 // Notify UI to refresh
                                 let _ = app_handle_clone.emit("vector-index-updated", ());
                             }
                         }
                         Err(e) => {
-                            let mut logs = logs_clone.lock().unwrap();
-                            logs.push(format!(
+                            tracing::error!(
                                 "Watcher Error: Failed to auto-embed symbols for {}: {}",
-                                rel_path_clone, e
-                            ));
+                                rel_path_clone,
+                                e
+                            );
                         }
                     }
                 });
@@ -348,8 +339,7 @@ async fn handle_debounced_changes(
                 let _ = conn.execute("DELETE FROM files WHERE path = ?1;", [&path_str]);
             }
 
-            let mut logs = app_state.logs.lock().unwrap();
-            logs.push(log_msg);
+            tracing::info!("{}", log_msg);
 
             let _ = app_handle.emit("vector-index-updated", ());
         }
