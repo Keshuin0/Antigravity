@@ -653,7 +653,6 @@ async fn run_process_and_stream(
 ) -> Result<(i32, String), String> {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use tokio::io::AsyncBufReadExt;
 
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
@@ -696,15 +695,37 @@ async fn run_process_and_stream(
     let total_bytes_out = total_bytes.clone();
     let limit_exceeded_out = limit_exceeded.clone();
     let stdout_handle = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stdout).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let line_len = line.len();
+        use tokio::io::AsyncReadExt;
+        let mut reader = tokio::io::BufReader::new(stdout);
+        let mut buf = vec![0u8; 4096];
+        let mut line_buf = Vec::new();
+        while let Ok(n) = reader.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            let line_len = chunk.len();
             let prev = total_bytes_out.fetch_add(line_len, Ordering::SeqCst);
             if prev + line_len > output_limit {
                 limit_exceeded_out.store(true, Ordering::SeqCst);
                 break;
             }
-            let _ = tx_out.send(line).await;
+
+            for &b in chunk {
+                if b == b'\n' {
+                    let line = String::from_utf8_lossy(&line_buf);
+                    let trimmed = line.trim_end_matches('\r').to_string();
+                    let _ = tx_out.send(trimmed).await;
+                    line_buf.clear();
+                } else {
+                    line_buf.push(b);
+                }
+            }
+        }
+        if !line_buf.is_empty() {
+            let line = String::from_utf8_lossy(&line_buf);
+            let trimmed = line.trim_end_matches('\r').to_string();
+            let _ = tx_out.send(trimmed).await;
         }
     });
 
@@ -714,19 +735,45 @@ async fn run_process_and_stream(
     let total_bytes_err = total_bytes.clone();
     let limit_exceeded_err = limit_exceeded.clone();
     let stderr_handle = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(stderr).lines();
-        while let Ok(Some(line)) = reader.next_line().await {
-            let line_len = line.len();
+        use tokio::io::AsyncReadExt;
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut buf = vec![0u8; 4096];
+        let mut line_buf = Vec::new();
+        while let Ok(n) = reader.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            let line_len = chunk.len();
             let prev = total_bytes_err.fetch_add(line_len, Ordering::SeqCst);
             if prev + line_len > output_limit {
                 limit_exceeded_err.store(true, Ordering::SeqCst);
                 break;
             }
+
+            for &b in chunk {
+                if b == b'\n' {
+                    let line = String::from_utf8_lossy(&line_buf);
+                    let trimmed = line.trim_end_matches('\r').to_string();
+                    {
+                        let mut accum = stderr_accum_clone.lock().unwrap();
+                        accum.push(trimmed.clone());
+                    }
+                    let _ = tx_err.send(trimmed).await;
+                    line_buf.clear();
+                } else {
+                    line_buf.push(b);
+                }
+            }
+        }
+        if !line_buf.is_empty() {
+            let line = String::from_utf8_lossy(&line_buf);
+            let trimmed = line.trim_end_matches('\r').to_string();
             {
                 let mut accum = stderr_accum_clone.lock().unwrap();
-                accum.push(line.clone());
+                accum.push(trimmed.clone());
             }
-            let _ = tx_err.send(line).await;
+            let _ = tx_err.send(trimmed).await;
         }
     });
 
@@ -759,6 +806,12 @@ async fn run_process_and_stream(
     let _ = stderr_handle.await;
 
     if limit_exceeded.load(Ordering::SeqCst) {
+        let _ = tx
+            .send(
+                "[Self-Healing Engine] Sandbox Error: Terminated due to excessive output (> 5MB)."
+                    .to_string(),
+            )
+            .await;
         return Err("Process terminated: output limit exceeded".to_string());
     }
 
