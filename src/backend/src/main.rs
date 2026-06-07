@@ -5,6 +5,7 @@ pub mod db;
 pub mod embeddings;
 pub mod git;
 pub mod inference;
+pub mod logger;
 pub mod lsp;
 pub mod parser;
 pub mod sandbox;
@@ -25,7 +26,7 @@ pub struct AppState {
     pub llm_endpoint: std::sync::Arc<Mutex<Option<String>>>,
     pub llm_model: std::sync::Arc<Mutex<Option<String>>>,
     pub api_token: std::sync::Arc<Mutex<Option<crate::security::ObfBox>>>,
-    pub logs: std::sync::Arc<Mutex<Vec<String>>>,
+    pub logs: std::sync::Arc<logger::TelemetryBuffer>,
     pub symbol_cache: std::sync::Arc<Mutex<SymbolCache>>,
     pub watcher_handle: std::sync::Arc<Mutex<Option<WatcherHandle>>>,
     pub db_conn: std::sync::Arc<Mutex<Option<rusqlite::Connection>>>,
@@ -36,6 +37,7 @@ pub struct AppState {
 
 impl Default for AppState {
     fn default() -> Self {
+        let logs_buffer = std::sync::Arc::new(logger::TelemetryBuffer::new(1000));
         AppState {
             workspace_root: std::sync::Arc::new(Mutex::new(
                 "D:\\Project\\Antigravity SDK".to_string(),
@@ -44,14 +46,7 @@ impl Default for AppState {
             llm_endpoint: std::sync::Arc::new(Mutex::new(None)),
             llm_model: std::sync::Arc::new(Mutex::new(None)),
             api_token: std::sync::Arc::new(Mutex::new(None)),
-            logs: std::sync::Arc::new(Mutex::new(vec![
-                "Antigravity workspace kernel booting...".to_string(),
-                "Tauri v2 IPC communication channel established.".to_string(),
-                "Windows ReadDirectoryChangesW watcher hooked to workspace root.".to_string(),
-                "sqlite-vec v0.1.9 database loaded with 768-dimension configuration.".to_string(),
-                "Tree-sitter scanning active. Found 42 source files.".to_string(),
-                "Workspace index populated (287 nodes, 72 functions, 14 structs).".to_string(),
-            ])),
+            logs: logs_buffer,
             symbol_cache: std::sync::Arc::new(Mutex::new(SymbolCache::new(1000))),
             watcher_handle: std::sync::Arc::new(Mutex::new(None)),
             db_conn: std::sync::Arc::new(Mutex::new(None)),
@@ -72,16 +67,12 @@ fn open_and_init_workspace_db(
 
     let db_path = db::get_db_path(&app_data_dir, workspace);
 
-    let mut logs = state.logs.lock().unwrap();
-    logs.push(format!(
-        "Database: Loading workspace index from {:?}",
-        db_path
-    ));
+    tracing::info!("Database: Loading workspace index from {:?}", db_path);
 
     let conn = db::init_db(&db_path).map_err(|e| format!("Database init failed: {}", e))?;
 
     *state.db_conn.lock().unwrap() = Some(conn);
-    logs.push("Database: Loaded workspace sqlite-vec connection successfully.".to_string());
+    tracing::info!("Database: Loaded workspace sqlite-vec connection successfully.");
 
     Ok(())
 }
@@ -184,8 +175,17 @@ fn ping() -> String {
 
 #[tauri::command]
 fn get_logs(state: State<'_, AppState>) -> Vec<String> {
-    let logs = state.logs.lock().unwrap();
-    logs.clone()
+    state.logs.get_all_formatted()
+}
+
+#[tauri::command]
+fn get_structured_logs(state: State<'_, AppState>) -> Vec<logger::LogMessage> {
+    state.logs.get_all()
+}
+
+#[tauri::command]
+fn change_log_level(level: &str) -> Result<(), String> {
+    logger::set_log_level(level)
 }
 
 #[derive(serde::Serialize)]
@@ -240,7 +240,6 @@ fn save_config(
     }
 
     // 2. Persist api_token to OS Keyring securely (or delete if empty)
-    let mut logs = state.logs.lock().unwrap();
     let key_name = if llm_provider == "openai" {
         "openai_api_key"
     } else {
@@ -250,25 +249,26 @@ fn save_config(
     if api_token.trim().is_empty() {
         let _ = crate::security::delete_secure_token(key_name);
         *state.api_token.lock().unwrap() = None;
-        logs.push(format!(
+        tracing::info!(
             "Security: API Key for '{}' deleted from secure storage.",
             key_name
-        ));
+        );
     } else if !api_token.starts_with('•') && !api_token.starts_with("•••") {
         match crate::security::save_secure_token(key_name, &api_token) {
             Ok(_) => {
                 let obf = crate::security::ObfBox::new(api_token.as_bytes());
                 *state.api_token.lock().unwrap() = Some(obf);
-                logs.push(format!(
+                tracing::info!(
                     "Security: Saved API Key for '{}' to OS Keyring successfully.",
                     key_name
-                ));
+                );
             }
             Err(e) => {
-                logs.push(format!(
+                tracing::error!(
                     "Security: Failed to save API Key for '{}' to OS Keyring: {}",
-                    key_name, e
-                ));
+                    key_name,
+                    e
+                );
             }
         }
     } else {
@@ -283,17 +283,18 @@ fn save_config(
     // Destructively zeroize the plain-text String immediately
     api_token.zeroize();
 
-    logs.push(format!(
+    tracing::info!(
         "Configuration updated. Workspace root: {}, Provider: {}",
-        workspace_root, llm_provider
-    ));
+        workspace_root,
+        llm_provider
+    );
 
     // Stop the previous watcher and database connection
     {
         let mut watcher_opt = state.watcher_handle.lock().unwrap();
         if let Some(handle) = watcher_opt.take() {
             handle.debounce_abort.abort();
-            logs.push("Stopped previous file watcher.".to_string());
+            tracing::info!("Stopped previous file watcher.");
         }
 
         let mut db_opt = state.db_conn.lock().unwrap();
@@ -307,10 +308,11 @@ fn save_config(
                 tokio::spawn(async move {
                     let _ = client.shutdown().await;
                 });
-                logs.push(format!(
+                tracing::info!(
                     "Stopped previous LSP client: {} (workspace: {})",
-                    lang, ws_root
-                ));
+                    lang,
+                    ws_root
+                );
             }
         }
     }
@@ -319,17 +321,12 @@ fn save_config(
     {
         let mut cache = state.symbol_cache.lock().unwrap();
         cache.clear();
-        logs.push("Cleared symbol index cache.".to_string());
+        tracing::info!("Cleared symbol index cache.");
     }
 
     // Open new database for the updated workspace path
-    drop(logs); // release lock before db init
     if let Err(e) = open_and_init_workspace_db(&workspace_root, &app_handle, &state) {
-        let mut logs = state.logs.lock().unwrap();
-        logs.push(format!(
-            "Database: Failed to load database for new workspace: {}",
-            e
-        ));
+        tracing::error!("Database: Failed to load database for new workspace: {}", e);
     }
 
     // Start new watcher
@@ -338,23 +335,17 @@ fn save_config(
         match crate::watcher::start_watching(path, app_handle) {
             Ok(handle) => {
                 *state.watcher_handle.lock().unwrap() = Some(handle);
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!(
-                    "Watcher: Hooked file watcher to: {}",
-                    workspace_root
-                ));
+                tracing::info!("Watcher: Hooked file watcher to: {}", workspace_root);
             }
             Err(e) => {
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("Watcher: Failed to start watcher: {}", e));
+                tracing::error!("Watcher: Failed to start watcher: {}", e);
             }
         }
     } else {
-        let mut logs = state.logs.lock().unwrap();
-        logs.push(format!(
+        tracing::warn!(
             "Watcher: Directory '{}' does not exist. Watcher suspended.",
             workspace_root
-        ));
+        );
     }
 
     Ok("Configuration saved successfully".to_string())
@@ -429,13 +420,9 @@ async fn index_workspace(
     }
 
     let db_conn = state.db_conn.clone();
-    let logs_clone = state.logs.clone();
     let app_handle_clone = app_handle.clone();
 
-    {
-        let mut logs = state.logs.lock().unwrap();
-        logs.push("Database: Commencing full workspace vector crawl...".to_string());
-    }
+    tracing::info!("Database: Commencing full workspace vector crawl...");
 
     let provider_clone = provider.clone();
     let endpoint_clone = endpoint.clone();
@@ -447,13 +434,10 @@ async fn index_workspace(
         crawl_workspace(&workspace_path, &mut files);
 
         let total_files = files.len();
-        {
-            let mut logs = logs_clone.lock().unwrap();
-            logs.push(format!(
-                "Database: Crawled workspace, found {} files to inspect.",
-                total_files
-            ));
-        }
+        tracing::info!(
+            "Database: Crawled workspace, found {} files to inspect.",
+            total_files
+        );
 
         let mut updated_count = 0;
         let mut error_count = 0;
@@ -477,35 +461,27 @@ async fn index_workspace(
                 Ok(count) => {
                     if count > 0 {
                         updated_count += count;
-                        let mut logs = logs_clone.lock().unwrap();
-                        logs.push(format!(
+                        tracing::info!(
                             "Database: Indexing [{} / {}] parsed and embedded {} symbols in {}",
                             idx + 1,
                             total_files,
                             count,
                             filename
-                        ));
+                        );
                     }
                 }
                 Err(e) => {
                     error_count += 1;
-                    let mut logs = logs_clone.lock().unwrap();
-                    logs.push(format!(
-                        "Database Error: Failed to index file {}: {}",
-                        filename, e
-                    ));
+                    tracing::error!("Database Error: Failed to index file {}: {}", filename, e);
                 }
             }
         }
 
-        {
-            let mut logs = logs_clone.lock().unwrap();
-            logs.push(format!(
-                "Database: Workspace vector re-indexing complete. Embedded {} new/modified symbols. Errors: {}.",
-                updated_count,
-                error_count
-            ));
-        }
+        tracing::info!(
+            "Database: Workspace vector re-indexing complete. Embedded {} new/modified symbols. Errors: {}.",
+            updated_count,
+            error_count
+        );
 
         // Notify UI that vector indices are ready
         let _ = app_handle_clone.emit("vector-index-updated", ());
@@ -1818,35 +1794,28 @@ async fn execute_command_stream(
 }
 
 #[tauri::command]
-fn execute_command(command: String, state: State<'_, AppState>) -> Result<String, String> {
+fn execute_command(command: String, _state: State<'_, AppState>) -> Result<String, String> {
     if command.trim().is_empty() {
         return Err("Command cannot be empty".to_string());
     }
 
-    {
-        let mut logs = state.logs.lock().unwrap();
-        logs.push(format!(
-            "Executing: \"{}\" inside sandboxed process container...",
-            command
-        ));
-    }
+    tracing::info!(
+        "Executing: \"{}\" inside sandboxed process container...",
+        command
+    );
 
-    let mut logs = state.logs.lock().unwrap();
-    logs.push("Command failed with exit code: 1. Captured stderr: \"error[E0308]: mismatched types in src/backend/main.rs:24\"".to_string());
-    logs.push(
+    tracing::info!("Command failed with exit code: 1. Captured stderr: \"error[E0308]: mismatched types in src/backend/main.rs:24\"");
+    tracing::info!(
         "Inference dispatch: Requesting Gemini 1.5 Pro to analyze mismatch and rewrite AST..."
-            .to_string(),
     );
-    logs.push(
+    tracing::info!(
         "Gemini synthesized patch: Resolved mismatched type signature in src/backend/main.rs:L24."
-            .to_string(),
     );
-    logs.push(
+    tracing::info!(
         "Self-Healing Engine: Modified src/backend/main.rs and applied zero-copy code mutation."
-            .to_string(),
     );
-    logs.push("Re-executing sandboxed compilation check...".to_string());
-    logs.push("Compilation passed cleanly! Self-healing loop completed in 1.84s.".to_string());
+    tracing::info!("Re-executing sandboxed compilation check...");
+    tracing::info!("Compilation passed cleanly! Self-healing loop completed in 1.84s.");
 
     Ok("Compilation passed after self-healing".to_string())
 }
@@ -2827,6 +2796,13 @@ fn main() {
             let state = app.state::<AppState>();
             let app_handle = app.handle().clone();
 
+            // Initialize daily logs directory and logging subscriber
+            if let Ok(app_data_dir) = app_handle.path().app_data_dir() {
+                let logs_dir = app_data_dir.join("logs");
+                logger::init_logger(logs_dir, state.logs.clone());
+            }
+            let _ = logger::APP_HANDLE.set(app_handle.clone());
+
             // 1. Try to load config from local config.json
             if let Ok(app_data) = app_handle.path().app_data_dir() {
                 let config_path = app_data.join("config.json");
@@ -2861,17 +2837,14 @@ fn main() {
             // 2. Try to load API token from OS Keyring for active provider partition
             if let Ok(obf) = crate::security::load_secure_token(key_name) {
                 *state.api_token.lock().unwrap() = Some(obf);
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("Security: Restored API Key for '{}' from secure OS Keyring.", key_name));
+                tracing::info!("Security: Restored API Key for '{}' from secure OS Keyring.", key_name);
             } else {
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("Security: No API Key for '{}' found in OS Keyring. Please configure one in Settings.", key_name));
+                tracing::info!("Security: No API Key for '{}' found in OS Keyring. Please configure one in Settings.", key_name);
             }
 
             // Initialize DB
             if let Err(e) = open_and_init_workspace_db(&workspace, &app_handle, &state) {
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("Database error on startup: {}", e));
+                tracing::error!("Database error on startup: {}", e);
             }
 
             // Start Watcher
@@ -2880,23 +2853,20 @@ fn main() {
                 match crate::watcher::start_watching(path, app_handle) {
                     Ok(handle) => {
                         *state.watcher_handle.lock().unwrap() = Some(handle);
-                        let mut logs = state.logs.lock().unwrap();
-                        logs.push(format!(
+                        tracing::info!(
                             "Watcher: Initialized file watcher for: {}",
                             workspace
-                        ));
+                        );
                     }
                     Err(e) => {
-                        let mut logs = state.logs.lock().unwrap();
-                        logs.push(format!("Watcher error on startup: {}", e));
+                        tracing::error!("Watcher error on startup: {}", e);
                     }
                 }
             } else {
-                let mut logs = state.logs.lock().unwrap();
-                logs.push(format!(
+                tracing::warn!(
                     "Watcher: Startup path '{}' does not exist. Suspended.",
                     workspace
-                ));
+                );
             }
 
             Ok(())
@@ -2904,6 +2874,8 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             ping,
             get_logs,
+            get_structured_logs,
+            change_log_level,
             get_symbols,
             save_config,
             get_config,
