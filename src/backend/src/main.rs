@@ -227,7 +227,7 @@ fn get_symbols(state: State<'_, AppState>) -> Vec<FileSymbols> {
 }
 
 #[tauri::command]
-fn save_config(
+async fn save_config(
     workspace_root: String,
     llm_provider: String,
     llm_endpoint: Option<String>,
