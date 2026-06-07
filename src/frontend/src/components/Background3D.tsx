@@ -1,11 +1,12 @@
+/* eslint-disable react/no-unknown-property */
 import React, { useRef } from 'react';
 import { Canvas, useFrame } from '@react-three/fiber';
 import { Points, PointMaterial } from '@react-three/drei';
-// @ts-ignore
+// @ts-expect-error: maath does not have exported types
 import * as random from 'maath/random/dist/maath-random.esm';
 
 function Starfield() {
-  const ref = useRef<any>();
+  const ref = useRef<import('three').Points>(null);
   // Generate random points in a sphere
   const [sphere] = React.useState(() => random.inSphere(new Float32Array(5000), { radius: 1.5 }));
 
