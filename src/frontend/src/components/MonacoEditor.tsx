@@ -858,7 +858,7 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
     <div className="w-full h-full flex flex-col relative select-none">
       {/* Editor breadcrumb header */}
       <div className="flex items-center px-4 py-2 bg-[#090d13] border-b border-white/5 text-xs text-neutral-400 select-none font-mono">
-        <svg className="w-3.5 h-3.5 mr-2 text-cyan-400 fill-current" viewBox="0 0 24 24">
+        <svg className="w-3.5 h-3.5 mr-2 text-primary fill-current" viewBox="0 0 24 24">
           <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
         </svg>
         <span className="truncate">
@@ -898,7 +898,7 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
               smoothScrolling: true,
             }}
             loading={
-              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-cyan-400/80 text-sm font-semibold tracking-wider animate-pulse">
+              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-primary/80 text-sm font-semibold tracking-wider animate-pulse">
                 LOADING SIDE-BY-SIDE DIFF...
               </div>
             }
@@ -939,7 +939,7 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
               formatOnPaste: true,
             }}
             loading={
-              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-cyan-400/80 text-sm font-semibold tracking-wider animate-pulse">
+              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-primary/80 text-sm font-semibold tracking-wider animate-pulse">
                 BOOTING MONACO LANGUAGE CONTEXT...
               </div>
             }

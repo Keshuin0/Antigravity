@@ -66,12 +66,12 @@ const TreeNode: React.FC<TreeNodeProps> = ({
         style={{ paddingLeft: `${depth * 12 + 6}px` }}
         className={`flex items-center py-1.5 px-2.5 cursor-pointer rounded-md transition-all duration-200 group relative ${
           isActive
-            ? 'bg-cyan-500/10 text-cyan-400 border-l-2 border-cyan-400 font-medium'
+            ? 'bg-primary/10 text-primary border-l-2 border-primary font-medium'
             : 'text-neutral-300 hover:bg-white/5 hover:text-white'
         }`}
       >
         {/* Glow effect on hover */}
-        <div className="absolute inset-0 rounded-md bg-cyan-400/0 group-hover:bg-cyan-400/2 opacity-10 transition-all duration-300 pointer-events-none" />
+        <div className="absolute inset-0 rounded-md bg-primary/0 group-hover:bg-primary/2 opacity-10 transition-all duration-300 pointer-events-none" />
 
         {/* Folder Arrow */}
         {entry.is_dir ? (
@@ -93,7 +93,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               <path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
             </svg>
           ) : (
-            <svg className="w-4 h-4 text-cyan-400 fill-current" viewBox="0 0 24 24">
+            <svg className="w-4 h-4 text-primary fill-current" viewBox="0 0 24 24">
               <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
             </svg>
           )}
@@ -109,7 +109,7 @@ const TreeNode: React.FC<TreeNodeProps> = ({
               e.stopPropagation();
               onFileAttach(entry.path);
             }}
-            className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-cyan-500/20 text-neutral-400 hover:text-cyan-400 transition-all duration-150"
+            className="p-1 rounded opacity-0 group-hover:opacity-100 hover:bg-primary/20 text-neutral-400 hover:text-primary transition-all duration-150"
             title="Attach to session"
           >
             <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
@@ -222,7 +222,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
               setLoading(false);
             }
           }}
-          className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-cyan-400 transition-colors"
+          className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-primary transition-colors"
           title="Refresh Workspace"
         >
           <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
