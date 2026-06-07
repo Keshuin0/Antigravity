@@ -140,7 +140,7 @@ const App: React.FC = () => {
 
   // Theme & Live Telemetry States
   const [colorTheme, setColorTheme] = useState<'obsidian' | 'emerald' | 'cyberpunk' | 'antigravity'>(() => {
-    return (localStorage.getItem('antigravity-theme') as any) || 'obsidian';
+    return (localStorage.getItem('antigravity-theme') as 'obsidian' | 'emerald' | 'cyberpunk' | 'antigravity') || 'obsidian';
   });
 
   useEffect(() => {
@@ -1047,7 +1047,7 @@ const App: React.FC = () => {
               ANTIGRAVITY WORKSPACE
             </h1>
             <p className="text-[8px] font-mono text-white/30 tracking-wider">
-              KERNEL: <span className={kernelStatus === 'active' ? 'text-emerald-400 font-bold' : kernelStatus === 'connecting' ? 'text-amber-400 font-bold' : 'text-rose-400 font-bold'}>{kernelStatus.toUpperCase()}</span> // CORE V2.0
+              KERNEL: <span className={kernelStatus === 'active' ? 'text-emerald-400 font-bold' : kernelStatus === 'connecting' ? 'text-amber-400 font-bold' : 'text-rose-400 font-bold'}>{kernelStatus.toUpperCase()}</span> {"// CORE V2.0"}
             </p>
           </div>
         </div>
