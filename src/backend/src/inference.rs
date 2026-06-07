@@ -290,7 +290,16 @@ pub async fn stream_generate_content_multiplexed(
             .await
             .map_err(|e| format!("Network request failed: {}", e))?
     } else {
-        let endpoint_url = endpoint.unwrap_or("http://localhost:8000/v1/chat/completions");
+        let mut endpoint_url = endpoint
+            .unwrap_or("http://localhost:8000/v1/chat/completions")
+            .to_string();
+        if !endpoint_url.ends_with("/chat/completions") && !endpoint_url.ends_with("/completions") {
+            if endpoint_url.ends_with('/') {
+                endpoint_url.push_str("chat/completions");
+            } else {
+                endpoint_url.push_str("/chat/completions");
+            }
+        }
         let model_name = model.unwrap_or("nvidia/llama-3.1-inst-70b");
 
         let payload = OpenAIChatRequest {
@@ -494,5 +503,41 @@ mod tests {
         assert_eq!(trim_byte_slice(b"  hello  "), b"hello");
         assert_eq!(trim_byte_slice(b"\nhello\r\n"), b"hello");
         assert_eq!(trim_byte_slice(b"hello"), b"hello");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_live_gemini_connection() {
+        let service = "com.antigravity.workspace";
+        let keyring_entry = keyring::Entry::new(service, "gemini_api_key").unwrap();
+        let key = keyring_entry
+            .get_password()
+            .expect("Gemini API key not found in keyring");
+        let obf = crate::security::ObfBox::new(key.as_bytes());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let handle = tokio::spawn(async move {
+            stream_generate_content_multiplexed(
+                "gemini",
+                None,
+                None,
+                &obf,
+                "say hello",
+                None,
+                tx,
+                None,
+            )
+            .await
+        });
+
+        let mut response = String::new();
+        while let Some(msg) = rx.recv().await {
+            response.push_str(&msg);
+        }
+
+        let res = handle.await.unwrap();
+        assert!(res.is_ok(), "Gemini stream returned error: {:?}", res);
+        println!("Gemini response: {}", response);
+        assert!(!response.is_empty());
     }
 }
