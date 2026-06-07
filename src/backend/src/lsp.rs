@@ -176,7 +176,7 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     };
 
     let mut child = std::process::Command::new(&npm_bin)
-        .args(&[
+        .args([
             "install",
             "--prefix",
             &local_servers_dir.to_string_lossy(),
@@ -195,7 +195,9 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     if status.success() && local_bin_path.exists() {
         let state = app_handle.state::<crate::AppState>();
         let mut logs = state.logs.lock().unwrap();
-        logs.push("LSP [typescript]: Automatic local installation completed successfully.".to_string());
+        logs.push(
+            "LSP [typescript]: Automatic local installation completed successfully.".to_string(),
+        );
         Ok(local_bin_path)
     } else {
         Err(format!(
@@ -205,11 +207,31 @@ fn resolve_typescript_server_path(app_handle: &AppHandle) -> Result<PathBuf, Str
     }
 }
 
-fn apply_incremental_edit(content: &mut String, range_val: &Value, new_text: &str) -> Result<(), String> {
-    let start_line = range_val.get("start").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range start line")? as usize;
-    let start_char = range_val.get("start").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range start character")? as usize;
-    let end_line = range_val.get("end").and_then(|pos| pos.get("line")).and_then(|v| v.as_u64()).ok_or("Invalid range end line")? as usize;
-    let end_char = range_val.get("end").and_then(|pos| pos.get("character")).and_then(|v| v.as_u64()).ok_or("Invalid range end character")? as usize;
+fn apply_incremental_edit(
+    content: &mut String,
+    range_val: &Value,
+    new_text: &str,
+) -> Result<(), String> {
+    let start_line = range_val
+        .get("start")
+        .and_then(|pos| pos.get("line"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range start line")? as usize;
+    let start_char = range_val
+        .get("start")
+        .and_then(|pos| pos.get("character"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range start character")? as usize;
+    let end_line = range_val
+        .get("end")
+        .and_then(|pos| pos.get("line"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range end line")? as usize;
+    let end_char = range_val
+        .get("end")
+        .and_then(|pos| pos.get("character"))
+        .and_then(|v| v.as_u64())
+        .ok_or("Invalid range end character")? as usize;
 
     let lines: Vec<&str> = content.split('\n').collect();
 
@@ -221,8 +243,8 @@ fn apply_incremental_edit(content: &mut String, range_val: &Value, new_text: &st
     let end_byte = utf16_char_to_utf8_byte_offset(lines[end_line], end_char)?;
 
     let mut new_content = String::new();
-    for i in 0..start_line {
-        new_content.push_str(lines[i]);
+    for line in lines.iter().take(start_line) {
+        new_content.push_str(line);
         new_content.push('\n');
     }
 
@@ -233,9 +255,9 @@ fn apply_incremental_edit(content: &mut String, range_val: &Value, new_text: &st
     let end_line_str = lines[end_line];
     new_content.push_str(&end_line_str[end_byte..]);
 
-    for i in (end_line + 1)..lines.len() {
+    for line in lines.iter().skip(end_line + 1) {
         new_content.push('\n');
-        new_content.push_str(lines[i]);
+        new_content.push_str(line);
     }
 
     *content = new_content;
@@ -333,7 +355,6 @@ impl LspClient {
         #[cfg(target_os = "windows")]
         let job_object = match win_job::JobObject::new() {
             Ok(job) => {
-                use std::os::windows::io::AsRawHandle;
                 if let Some(raw_handle) = child.raw_handle() {
                     let _ = job.assign_process(raw_handle as *mut std::os::raw::c_void);
                 }
@@ -342,7 +363,10 @@ impl LspClient {
             Err(e) => {
                 let state = app_handle.state::<crate::AppState>();
                 let mut logs = state.logs.lock().unwrap();
-                logs.push(format!("LSP warning: failed to create process sandbox: {}", e));
+                logs.push(format!(
+                    "LSP warning: failed to create process sandbox: {}",
+                    e
+                ));
                 None
             }
         };
@@ -548,7 +572,10 @@ impl LspClient {
                         {
                             let mut state_clients = state.lsp_clients.lock().unwrap();
                             if let Some(map) = state_clients.as_mut() {
-                                map.insert((root_path_mon.clone(), lang_name_mon.clone()), new_client.clone());
+                                map.insert(
+                                    (root_path_mon.clone(), lang_name_mon.clone()),
+                                    new_client.clone(),
+                                );
                             }
                         }
 
@@ -734,22 +761,32 @@ impl LspClient {
             "contentChanges": [change]
         });
 
+        let mut patch_error = None;
         // Update stored contents for self-healing registry
         {
             let mut files = self.open_files.lock().unwrap();
             if let Some(content) = files.get_mut(path) {
                 if let Some(ref r) = range {
                     if let Err(e) = apply_incremental_edit(content, r, text) {
-                        let _ = self.send_notification("telemetry/event", json!({
-                            "type": "error",
-                            "message": format!("LSP Incremental patch failed: {}", e)
-                        }));
+                        patch_error = Some(format!("LSP Incremental patch failed: {}", e));
                     }
                 } else {
                     // Full sync update
                     *content = text.to_string();
                 }
             }
+        }
+
+        if let Some(err_msg) = patch_error {
+            let _ = self
+                .send_notification(
+                    "telemetry/event",
+                    json!({
+                        "type": "error",
+                        "message": err_msg
+                    }),
+                )
+                .await;
         }
 
         self.send_notification("textDocument/didChange", params)
@@ -818,4 +855,3 @@ mod tests {
         assert_eq!(byte_offset_end, 10);
     }
 }
-

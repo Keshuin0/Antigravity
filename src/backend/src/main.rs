@@ -306,7 +306,10 @@ fn save_config(
                 tokio::spawn(async move {
                     let _ = client.shutdown().await;
                 });
-                logs.push(format!("Stopped previous LSP client: {} (workspace: {})", lang, ws_root));
+                logs.push(format!(
+                    "Stopped previous LSP client: {} (workspace: {})",
+                    lang, ws_root
+                ));
             }
         }
     }
@@ -716,36 +719,414 @@ async fn run_process_and_stream(
     Ok((exit_code, full_stderr))
 }
 
-fn find_error_file_in_stderr(stderr: &str, workspace: &str) -> Option<PathBuf> {
-    let clean_workspace = crate::watcher::clean_unc_path(Path::new(workspace));
+#[derive(serde::Deserialize)]
+struct LlmPatchResponse {
+    patched_code: String,
+    new_imports: String,
+}
 
-    for word in stderr.split_whitespace() {
-        let cleaned = word.trim_matches(|c: char| {
-            c == ':' || c == ',' || c == '"' || c == '\'' || c == '(' || c == ')'
-        });
-
-        let path = Path::new(cleaned);
-        if path.is_file() {
-            let clean_path = crate::watcher::clean_unc_path(path);
-            if clean_path.starts_with(&clean_workspace) {
-                return Some(clean_path);
+fn strip_ansi_escapes(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+        } else if in_escape {
+            if c == 'm' || c.is_ascii_alphabetic() {
+                in_escape = false;
             }
+        } else {
+            result.push(c);
         }
+    }
+    result
+}
 
-        let rel_path = clean_workspace.join(cleaned);
-        if rel_path.is_file() {
-            return Some(crate::watcher::clean_unc_path(&rel_path));
-        }
+#[derive(Debug, Clone)]
+struct ParsedError {
+    file_path: PathBuf,
+    line: usize,
+    column: usize,
+}
 
-        let mut path_parts = cleaned.split(':');
-        if let Some(first_part) = path_parts.next() {
-            let rel_path_part = clean_workspace.join(first_part);
-            if rel_path_part.is_file() {
-                return Some(crate::watcher::clean_unc_path(&rel_path_part));
+fn parse_error_coordinates(word: &str, workspace: &Path) -> Option<ParsedError> {
+    let mut cleaned_word = word.trim_matches(|c: char| {
+        c == ':' || c == ',' || c == '"' || c == '\'' || c == '[' || c == ']'
+    });
+
+    if !cleaned_word.contains('(') || !cleaned_word.ends_with(')') {
+        cleaned_word = cleaned_word.trim_matches(|c: char| c == '(' || c == ')');
+    }
+
+    if cleaned_word.is_empty() {
+        return None;
+    }
+
+    // Handle TS format: path(line,col)
+    if let Some(open_paren) = cleaned_word.find('(') {
+        if let Some(close_paren) = cleaned_word.find(')') {
+            if close_paren > open_paren {
+                let path_str = &cleaned_word[..open_paren];
+                let coords_str = &cleaned_word[open_paren + 1..close_paren];
+                let parts: Vec<&str> = coords_str.split(',').collect();
+                if !parts.is_empty() {
+                    let line = parts[0].trim().parse::<usize>().ok()?;
+                    let col = if parts.len() >= 2 {
+                        parts[1].trim().parse::<usize>().unwrap_or(1)
+                    } else {
+                        1
+                    };
+
+                    let path = Path::new(path_str);
+                    let clean_path = crate::watcher::clean_unc_path(path);
+                    if clean_path.is_file() && clean_path.starts_with(workspace) {
+                        return Some(ParsedError {
+                            file_path: clean_path,
+                            line,
+                            column: col,
+                        });
+                    }
+                    let rel_path = workspace.join(path_str);
+                    if rel_path.is_file() {
+                        return Some(ParsedError {
+                            file_path: crate::watcher::clean_unc_path(&rel_path),
+                            line,
+                            column: col,
+                        });
+                    }
+                }
             }
         }
     }
+
+    // Handle general format: path:line:col
+    let parts: Vec<&str> = cleaned_word.split(':').collect();
+    if parts.len() >= 2 {
+        let is_windows_drive =
+            parts[0].len() == 1 && parts[0].chars().next().unwrap().is_ascii_alphabetic();
+
+        let (path_str, line_idx, col_idx) = if is_windows_drive && parts.len() >= 3 {
+            let full_path = format!("{}:{}", parts[0], parts[1]);
+            (full_path, 2, 3)
+        } else {
+            (parts[0].to_string(), 1, 2)
+        };
+
+        if line_idx < parts.len() {
+            if let Ok(line) = parts[line_idx].trim().parse::<usize>() {
+                let col = if col_idx < parts.len() {
+                    parts[col_idx]
+                        .trim()
+                        .trim_end_matches(|c: char| !c.is_ascii_digit())
+                        .parse::<usize>()
+                        .unwrap_or(1)
+                } else {
+                    1
+                };
+
+                let path = Path::new(&path_str);
+                let clean_path = crate::watcher::clean_unc_path(path);
+                if clean_path.is_file() && clean_path.starts_with(workspace) {
+                    return Some(ParsedError {
+                        file_path: clean_path,
+                        line,
+                        column: col,
+                    });
+                }
+                let rel_path = workspace.join(&path_str);
+                if rel_path.is_file() {
+                    return Some(ParsedError {
+                        file_path: crate::watcher::clean_unc_path(&rel_path),
+                        line,
+                        column: col,
+                    });
+                }
+            }
+        }
+    }
+
     None
+}
+
+fn find_all_error_locations(stderr: &str, workspace_root: &str) -> Vec<ParsedError> {
+    let clean_workspace = crate::watcher::clean_unc_path(Path::new(workspace_root));
+    let stripped_stderr = strip_ansi_escapes(stderr);
+    let mut locations = Vec::new();
+
+    for line in stripped_stderr.lines() {
+        if line.contains("--> ") {
+            if let Some(idx) = line.find("--> ") {
+                let suffix = &line[idx + 4..];
+                if let Some(err) = parse_error_coordinates(suffix, &clean_workspace) {
+                    locations.push(err);
+                    continue;
+                }
+            }
+        }
+
+        for word in line.split_whitespace() {
+            if let Some(err) = parse_error_coordinates(word, &clean_workspace) {
+                if !locations.iter().any(|loc| {
+                    loc.file_path == err.file_path
+                        && loc.line == err.line
+                        && loc.column == err.column
+                }) {
+                    locations.push(err);
+                }
+            }
+        }
+    }
+
+    locations
+}
+
+fn extract_referenced_symbols(stderr: &str) -> std::collections::HashSet<String> {
+    let stripped = strip_ansi_escapes(stderr);
+    let mut symbols = std::collections::HashSet::new();
+
+    for word in stripped.split_whitespace() {
+        let cleaned = word.trim_matches(|c: char| {
+            c == '`'
+                || c == '\''
+                || c == '"'
+                || c == ':'
+                || c == ','
+                || c == ';'
+                || c == '.'
+                || c == '('
+                || c == ')'
+                || c == '{'
+                || c == '}'
+                || c == '['
+                || c == ']'
+                || c == '<'
+                || c == '>'
+                || c == '?'
+                || c == '!'
+                || c == '*'
+                || c == '&'
+        });
+
+        if cleaned.len() >= 3 && cleaned.len() <= 64 {
+            let mut chars = cleaned.chars();
+            if let Some(first) = chars.next() {
+                if (first.is_ascii_alphabetic() || first == '_')
+                    && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    let ignore_keywords = [
+                        "let",
+                        "mut",
+                        "struct",
+                        "class",
+                        "interface",
+                        "impl",
+                        "enum",
+                        "fn",
+                        "function",
+                        "let",
+                        "const",
+                        "var",
+                        "import",
+                        "export",
+                        "use",
+                        "pub",
+                        "std",
+                        "Result",
+                        "Option",
+                        "Vec",
+                        "String",
+                        "usize",
+                        "u8",
+                        "f32",
+                        "i64",
+                        "self",
+                        "Self",
+                        "return",
+                        "match",
+                        "if",
+                        "else",
+                        "true",
+                        "false",
+                        "for",
+                        "while",
+                        "loop",
+                        "break",
+                        "continue",
+                        "crate",
+                        "mod",
+                        "type",
+                        "as",
+                        "dyn",
+                        "where",
+                        "expect",
+                        "expected",
+                        "found",
+                        "mismatched",
+                        "types",
+                        "mismatch",
+                        "error",
+                        "warning",
+                        "compilation",
+                        "failed",
+                        "compiler",
+                    ];
+                    if !ignore_keywords.contains(&cleaned) {
+                        symbols.insert(cleaned.to_string());
+                    }
+                }
+            }
+        }
+    }
+    symbols
+}
+
+fn fetch_symbol_context(conn: &rusqlite::Connection, symbol_name: &str) -> Option<String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.kind, f.path, f.content, s.start_line, s.end_line, s.signature 
+         FROM symbols s
+         JOIN files f ON f.id = s.file_id
+         WHERE s.name = ?1
+         LIMIT 1;",
+        )
+        .ok()?;
+
+    let row = stmt
+        .query_row([symbol_name], |r| {
+            let kind: String = r.get(0)?;
+            let path: String = r.get(1)?;
+            let content: String = r.get(2)?;
+            let start_line: usize = r.get(3)?;
+            let end_line: usize = r.get(4)?;
+            let signature: Option<String> = r.get(5)?;
+            Ok((kind, path, content, start_line, end_line, signature))
+        })
+        .ok()?;
+
+    let (kind, path_str, content, start, end, signature) = row;
+
+    let lines: Vec<&str> = content.lines().collect();
+    let start_0 = start.saturating_sub(1);
+    let end_limit = end.min(lines.len());
+    let code_block = if start_0 < lines.len() {
+        lines[start_0..end_limit].join("\n")
+    } else {
+        signature.unwrap_or_else(|| symbol_name.to_string())
+    };
+
+    let filename = Path::new(&path_str).file_name()?.to_string_lossy();
+
+    Some(format!(
+        "Reference Definition: {} '{}' (defined in {}):\n---\n{}\n---\n",
+        kind, symbol_name, filename, code_block
+    ))
+}
+
+fn has_syntax_errors(node: tree_sitter::Node) -> bool {
+    if node.is_error() || node.is_missing() {
+        return true;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if has_syntax_errors(child) {
+            return true;
+        }
+    }
+    false
+}
+
+fn validate_patch_syntax(code: &str, language: &str) -> bool {
+    let ts_lang = match language {
+        "rust" => Some(tree_sitter_rust::language()),
+        "typescript" => Some(tree_sitter_typescript::language_typescript()),
+        _ => None,
+    };
+
+    let lang = match ts_lang {
+        Some(l) => l,
+        None => return true,
+    };
+
+    let mut parser = tree_sitter::Parser::new();
+    if parser.set_language(&lang).is_err() {
+        return true;
+    }
+
+    if let Some(tree) = parser.parse(code, None) {
+        let root = tree.root_node();
+        !has_syntax_errors(root)
+    } else {
+        false
+    }
+}
+
+fn insert_imports_to_source(content: &mut String, new_imports: &str, language: &str) {
+    if new_imports.trim().is_empty() {
+        return;
+    }
+
+    let mut insert_pos = 0;
+
+    let ts_lang = match language {
+        "rust" => Some(tree_sitter_rust::language()),
+        "typescript" => Some(tree_sitter_typescript::language_typescript()),
+        _ => None,
+    };
+
+    if let Some(lang) = ts_lang {
+        let mut parser = tree_sitter::Parser::new();
+        if parser.set_language(&lang).is_ok() {
+            if let Some(tree) = parser.parse(content.as_str(), None) {
+                let root = tree.root_node();
+                let mut cursor = root.walk();
+                for child in root.children(&mut cursor) {
+                    let kind = child.kind();
+                    if kind == "inner_attribute_item"
+                        || kind == "line_comment"
+                        || kind == "block_comment"
+                    {
+                        insert_pos = child.end_byte();
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // Skip any trailing whitespace/newlines after the attributes/comments
+    let bytes = content.as_bytes();
+    while insert_pos < bytes.len() && bytes[insert_pos].is_ascii_whitespace() {
+        insert_pos += 1;
+    }
+
+    let mut prepended = String::new();
+    if insert_pos == 0 {
+        prepended.push_str(new_imports.trim());
+        prepended.push('\n');
+        prepended.push_str(content);
+        *content = prepended;
+    } else {
+        prepended.push_str(&content[..insert_pos]);
+        prepended.push_str(new_imports.trim());
+        prepended.push('\n');
+        prepended.push_str(&content[insert_pos..]);
+        *content = prepended;
+    }
+}
+
+fn extract_json_from_response(s: &str) -> String {
+    let mut cleaned = s.trim();
+    if cleaned.starts_with("```") {
+        cleaned = cleaned
+            .trim_start_matches('`')
+            .trim_start_matches("json")
+            .trim_start_matches(['\n', '\r']);
+        if let Some(end_pos) = cleaned.rfind("```") {
+            cleaned = &cleaned[..end_pos];
+        }
+    }
+    cleaned.trim().to_string()
 }
 
 fn extract_markdown_code_block(content: &str) -> String {
@@ -1003,24 +1384,26 @@ async fn self_healing_loop(
             exit_code, recursion_depth, max_depth
         ));
 
-        let error_file_path = find_error_file_in_stderr(&stderr_output, &workspace);
-        let file_path = match error_file_path {
-            Some(path) => path,
-            None => {
-                let _ = channel.send("[Self-Healing Engine] Could not locate failing source file in logs. Self-healing aborted.".to_string());
-                if is_git {
-                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
-                }
-                return Err("Failed to locate target file in stderr".to_string());
+        let locations = find_all_error_locations(&stderr_output, &workspace);
+        if locations.is_empty() {
+            let _ = channel.send("[Self-Healing Engine] Could not locate failing source file in logs. Self-healing aborted.".to_string());
+            if is_git {
+                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
             }
-        };
+            return Err("Failed to locate target file in stderr".to_string());
+        }
+
+        let target_err = &locations[0];
+        let file_path = &target_err.file_path;
+        let line = target_err.line;
+        let col = target_err.column;
 
         let file_name = file_path
             .file_name()
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        let file_content = match std::fs::read_to_string(&file_path) {
+        let file_content = match std::fs::read_to_string(file_path) {
             Ok(content) => content,
             Err(e) => {
                 let _ = channel.send(format!(
@@ -1052,33 +1435,30 @@ async fn self_healing_loop(
             };
 
             if let Some(client) = client_opt {
-                if let Some((line, col)) = find_error_location_in_stderr(&stderr_output, &file_path) {
-                    let _ = channel.send(format!(
-                        "[Self-Healing Engine] Found compiler error at {}:{}:{}. Checking LSP quick-fixes...",
-                        file_path.file_name().unwrap_or_default().to_string_lossy(),
-                        line,
-                        col
-                    ));
-                    match try_lsp_quickfix(&client, &file_path, line, col, &channel).await {
-                        Ok(true) => {
-                            quickfix_applied = true;
-                        }
-                        Ok(false) => {
-                            let _ = channel.send("[Self-Healing Engine] No quick-fixes available from LSP. Falling back to LLM...".to_string());
-                        }
-                        Err(e) => {
-                            let _ = channel.send(format!(
-                                "[Self-Healing Engine] LSP quick-fix query encountered an error: {}. Falling back to LLM...",
-                                e
-                            ));
-                        }
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] Found compiler error at {}:{}:{}. Checking LSP quick-fixes...",
+                    file_name,
+                    line,
+                    col
+                ));
+                match try_lsp_quickfix(&client, file_path, line, col, &channel).await {
+                    Ok(true) => {
+                        quickfix_applied = true;
+                    }
+                    Ok(false) => {
+                        let _ = channel.send("[Self-Healing Engine] No quick-fixes available from LSP. Falling back to LLM...".to_string());
+                    }
+                    Err(e) => {
+                        let _ = channel.send(format!(
+                            "[Self-Healing Engine] LSP quick-fix query encountered an error: {}. Falling back to LLM...",
+                            e
+                        ));
                     }
                 }
             }
         }
 
         if quickfix_applied {
-            // We successfully applied a quick-fix. Re-run compilation directly!
             let _ = channel.send(format!(
                 "[Self-Healing Engine] Applied LSP quick-fix to '{}'. Re-running compiler immediately...",
                 file_name
@@ -1086,29 +1466,105 @@ async fn self_healing_loop(
             continue;
         }
 
-        let _ = channel.send(format!(
-            "[Self-Healing Engine] Isolated failing file: '{}'. Querying code fix from LLM ({}/{})...",
-            file_name, provider, model.as_deref().unwrap_or("default")
-        ));
+        // Run Tree-sitter Scope Isolation
+        let isolated_scope = crate::parser::isolate_ast_scope(file_path, &file_content, line, col);
 
-        let prompt = format!(
-            "You are Antigravity's autonomous self-healing compilation agent.\n\
-             A compiler check failed. Here is the stderr output:\n\
-             ---\n\
-             {}\n\
-             ---\n\
-             Here is the current content of the source file '{}' that caused the compilation failure:\n\
-             ---\n\
-             {}\n\
-             ---\n\
-             Please rewrite this file to resolve the compilation error.\n\
-             IMPORTANT: Return ONLY the complete, modified code content for this file inside a markdown code block starting with ```[language]. Do not include any other explanations, comments, or conversational text. Return ONLY the markdown code block.",
-            stderr_output, file_name, file_content
-        );
+        // Build Cross-Reference RAG Context using database symbol index
+        let mut rag_context = String::new();
+        if let Some(conn) = state.db_conn.lock().unwrap().as_ref() {
+            let referenced_symbols = extract_referenced_symbols(&stderr_output);
+            for sym in referenced_symbols {
+                if let Some(ctx) = fetch_symbol_context(conn, &sym) {
+                    rag_context.push_str(&ctx);
+                    rag_context.push('\n');
+                }
+            }
+        }
+
+        // Build LLM Prompt depending on scope isolation results
+        let (prompt, scope_info) = if let Some(ref scope) = isolated_scope {
+            let info = format!(
+                "File: {}\nScope Type: {}\nScope Name: {}\nLines: {}-{}\n",
+                file_name, scope.kind, scope.name, scope.start_line, scope.end_line
+            );
+
+            let prompt = format!(
+                "You are Antigravity's autonomous self-healing compilation agent.\n\
+                 A compiler check failed. Here is the stderr output:\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Here is the current content of the isolated structural scope '{}' (kind: '{}') inside the file '{}':\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Here is some additional workspace cross-reference context from the codebase:\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Please write a patch for this isolated scope to resolve the compilation error.\n\
+                 IMPORTANT: You must return a structured JSON object. Do not include any explanations or other text outside the JSON.\n\
+                 Your output must be a single JSON block formatted exactly like this:\n\
+                 ```json\n\
+                 {{\n\
+                   \"patched_code\": \"<Your patched replacement code for the isolated scope only>\",\n\
+                   \"new_imports\": \"<Any new import/use statements required by your patch, or empty string if none>\"\n\
+                 }}\n\
+                 ```\n\
+                 Do not return any explanations, comments, or other markdown. Return ONLY the json block.",
+                stderr_output, scope.name, scope.kind, file_name, scope.content, rag_context
+            );
+            (prompt, Some(info))
+        } else {
+            let prompt = format!(
+                "You are Antigravity's autonomous self-healing compilation agent.\n\
+                 A compiler check failed. Here is the stderr output:\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Here is the current content of the source file '{}' that caused the compilation failure:\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Here is some additional workspace cross-reference context from the codebase:\n\
+                 ---\n\
+                 {}\n\
+                 ---\n\
+                 Please rewrite this file to resolve the compilation error.\n\
+                 IMPORTANT: You must return a structured JSON object. Do not include any explanations or other text outside the JSON.\n\
+                 Your output must be a single JSON block formatted exactly like this:\n\
+                 ```json\n\
+                 {{\n\
+                   \"patched_code\": \"<Your patched code for the entire file>\",\n\
+                   \"new_imports\": \"\"\n\
+                 }}\n\
+                 ```\n\
+                 Do not return any explanations, comments, or other markdown. Return ONLY the json block.",
+                stderr_output, file_name, file_content, rag_context
+            );
+            (prompt, None)
+        };
+
+        if let Some(ref info) = scope_info {
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Isolated failing scope:\n{}",
+                info
+            ));
+        } else {
+            let _ = channel.send(format!(
+                "[Self-Healing Engine] Falling back to full-file healing for '{}'.",
+                file_name
+            ));
+        }
+
+        let _ = channel.send(format!(
+            "[Self-Healing Engine] Querying code fix from LLM ({}/{})...",
+            provider,
+            model.as_deref().unwrap_or("default")
+        ));
 
         let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(100);
         let stream_channel = channel.clone();
-
         let stream_batcher = tokio::spawn(run_micro_batcher(stream_rx, stream_channel));
 
         let mut collected_response = String::new();
@@ -1116,7 +1572,6 @@ async fn self_healing_loop(
 
         let api_key_clone = final_api_key.clone();
         let stream_tx_clone = stream_tx.clone();
-
         let provider_clone = provider.clone();
         let endpoint_clone = endpoint.clone();
         let model_clone = model.clone();
@@ -1145,33 +1600,104 @@ async fn self_healing_loop(
         drop(stream_tx_clone);
         let _ = stream_batcher.await;
 
-        let patched_code = extract_markdown_code_block(&collected_response);
-        if patched_code.trim().is_empty() {
-            let _ = channel.send(
-                "[Self-Healing Engine] LLM returned empty or invalid patch format. Healing failed."
-                    .to_string(),
-            );
-            if is_git {
-                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+        let json_str = extract_json_from_response(&collected_response);
+        let parsed_patch: Result<LlmPatchResponse, _> = serde_json::from_str(&json_str);
+
+        let lang_name = file_path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let syntax_lang = match lang_name {
+            "rs" => "rust",
+            "ts" | "tsx" | "js" | "jsx" => "typescript",
+            _ => "other",
+        };
+
+        let mut applied = false;
+        if let Ok(ref patch) = parsed_patch {
+            if validate_patch_syntax(&patch.patched_code, syntax_lang) {
+                if let Some(ref scope) = isolated_scope {
+                    let mut new_content = file_content.clone();
+                    if scope.start_byte <= new_content.len() && scope.end_byte <= new_content.len()
+                    {
+                        new_content
+                            .replace_range(scope.start_byte..scope.end_byte, &patch.patched_code);
+                        insert_imports_to_source(&mut new_content, &patch.new_imports, syntax_lang);
+
+                        if let Err(e) = std::fs::write(file_path, &new_content) {
+                            let _ = channel.send(format!(
+                                "[Self-Healing Engine] Failed to write patched file to disk: {}",
+                                e
+                            ));
+                            if is_git {
+                                rollback_and_cleanup_git(
+                                    &workspace,
+                                    original_branch.as_deref(),
+                                    temp_branch,
+                                );
+                            }
+                            return Err(format!("Failed to write patch: {}", e));
+                        }
+                        let _ = channel.send(format!(
+                            "[Self-Healing Engine] Applied AST range patch to scope '{}' in '{}'. Re-running check...",
+                            scope.name, file_name
+                        ));
+                        applied = true;
+                    }
+                } else {
+                    if let Err(e) = std::fs::write(file_path, &patch.patched_code) {
+                        let _ = channel.send(format!(
+                            "[Self-Healing Engine] Failed to write patched file to disk: {}",
+                            e
+                        ));
+                        if is_git {
+                            rollback_and_cleanup_git(
+                                &workspace,
+                                original_branch.as_deref(),
+                                temp_branch,
+                            );
+                        }
+                        return Err(format!("Failed to write patch: {}", e));
+                    }
+                    let _ = channel.send(format!(
+                        "[Self-Healing Engine] Applied full-file patch to '{}'. Re-running check...",
+                        file_name
+                    ));
+                    applied = true;
+                }
+            } else {
+                let _ = channel.send("[Self-Healing Engine] Tree-sitter validation failed: generated patch contains syntax errors.".to_string());
             }
-            return Err("LLM returned invalid patch format".to_string());
         }
 
-        if let Err(e) = std::fs::write(&file_path, &patched_code) {
-            let _ = channel.send(format!(
-                "[Self-Healing Engine] Failed to write patch to disk: {}",
-                e
-            ));
-            if is_git {
-                rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+        if !applied {
+            // Fallback: try raw markdown block extraction as full file replacement
+            let fallback_code = extract_markdown_code_block(&collected_response);
+            if !fallback_code.trim().is_empty() {
+                let _ = channel.send("[Self-Healing Engine] JSON parsing or syntax validation failed. Falling back to full-file markdown block replacement...".to_string());
+                if let Err(e) = std::fs::write(file_path, &fallback_code) {
+                    let _ = channel.send(format!(
+                        "[Self-Healing Engine] Failed to write fallback patch to disk: {}",
+                        e
+                    ));
+                    if is_git {
+                        rollback_and_cleanup_git(
+                            &workspace,
+                            original_branch.as_deref(),
+                            temp_branch,
+                        );
+                    }
+                    return Err(format!("Failed to write fallback patch: {}", e));
+                }
+                let _ = channel.send(format!(
+                    "[Self-Healing Engine] Applied full-file fallback patch to '{}'. Re-running check...",
+                    file_name
+                ));
+            } else {
+                let _ = channel.send("[Self-Healing Engine] LLM returned empty or invalid patch format. Healing failed.".to_string());
+                if is_git {
+                    rollback_and_cleanup_git(&workspace, original_branch.as_deref(), temp_branch);
+                }
+                return Err("LLM returned invalid patch format".to_string());
             }
-            return Err(format!("Failed to write patch: {}", e));
         }
-
-        let _ = channel.send(format!(
-            "[Self-Healing Engine] Applied zero-copy code mutation to '{}'. Re-running check...",
-            file_name
-        ));
     }
 }
 
@@ -1473,46 +1999,6 @@ fn get_lsp_client_for_request(
     }
 }
 
-fn find_error_location_in_stderr(stderr: &str, file_path: &Path) -> Option<(usize, usize)> {
-    let file_name = file_path.file_name()?.to_str()?;
-    for line in stderr.lines() {
-        if line.contains(file_name) {
-            if let Some(idx) = line.find(file_name) {
-                let suffix = &line[idx + file_name.len()..];
-                if suffix.starts_with(':') {
-                    let parts: Vec<&str> = suffix[1..].split(':').collect();
-                    if !parts.is_empty() {
-                        if let Ok(line_num) = parts[0].trim().parse::<usize>() {
-                            let col_num = if parts.len() >= 2 {
-                                parts[1].trim().trim_end_matches(|c: char| !c.is_ascii_digit()).parse::<usize>().unwrap_or(1)
-                            } else {
-                                1
-                            };
-                            return Some((line_num, col_num));
-                        }
-                    }
-                }
-                if suffix.starts_with('(') {
-                    if let Some(inside) = suffix[1..].split(')').next() {
-                        let parts: Vec<&str> = inside.split(',').collect();
-                        if !parts.is_empty() {
-                            if let Ok(line_num) = parts[0].trim().parse::<usize>() {
-                                let col_num = if parts.len() >= 2 {
-                                    parts[1].trim().parse::<usize>().unwrap_or(1)
-                                } else {
-                                    1
-                                };
-                                return Some((line_num, col_num));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
 async fn try_lsp_quickfix(
     client: &lsp::LspClient,
     file_path: &Path,
@@ -1546,7 +2032,7 @@ async fn try_lsp_quickfix(
         serde_json::json!({
             "start": { "line": line_0.saturating_sub(5), "character": 0 },
             "end": { "line": line_0 + 5, "character": 999 }
-        })
+        }),
     ];
 
     for (idx, range) in ranges.into_iter().enumerate() {
@@ -1569,7 +2055,8 @@ async fn try_lsp_quickfix(
             Ok(actions_val) => {
                 if let Some(actions) = actions_val.as_array() {
                     for action in actions {
-                        let is_quickfix = action.get("kind")
+                        let is_quickfix = action
+                            .get("kind")
                             .and_then(|k| k.as_str())
                             .map(|k| k.contains("quickfix"))
                             .unwrap_or(true);
@@ -1577,7 +2064,10 @@ async fn try_lsp_quickfix(
                         if is_quickfix {
                             if let Some(edit) = action.get("edit") {
                                 if apply_workspace_edit(edit).is_ok() {
-                                    let title = action.get("title").and_then(|t| t.as_str()).unwrap_or("LSP Quick-Fix");
+                                    let title = action
+                                        .get("title")
+                                        .and_then(|t| t.as_str())
+                                        .unwrap_or("LSP Quick-Fix");
                                     let _ = channel.send(format!(
                                         "[Self-Healing Engine] Successfully applied LSP Quick-Fix: '{}'",
                                         title
@@ -1602,7 +2092,8 @@ async fn try_lsp_quickfix(
 }
 
 fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
-    let mut file_edits: std::collections::HashMap<PathBuf, Vec<LocalTextEdit>> = std::collections::HashMap::new();
+    let mut file_edits: std::collections::HashMap<PathBuf, Vec<LocalTextEdit>> =
+        std::collections::HashMap::new();
 
     if let Some(changes) = edit.get("changes").and_then(|c| c.as_object()) {
         for (uri, edits_val) in changes {
@@ -1626,10 +2117,15 @@ fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
                 if let Some(uri) = text_doc.get("uri").and_then(|u| u.as_str()) {
                     if let Ok(url) = tauri::Url::parse(uri) {
                         if let Ok(path) = url.to_file_path() {
-                            if let Some(edits_val) = change_val.get("edits").and_then(|e| e.as_array()) {
+                            if let Some(edits_val) =
+                                change_val.get("edits").and_then(|e| e.as_array())
+                            {
                                 for edit_val in edits_val {
                                     if let Some(local_edit) = parse_local_edit(edit_val) {
-                                        file_edits.entry(path.clone()).or_default().push(local_edit);
+                                        file_edits
+                                            .entry(path.clone())
+                                            .or_default()
+                                            .push(local_edit);
                                     }
                                 }
                             }
@@ -1649,7 +2145,8 @@ fn apply_workspace_edit(edit: &serde_json::Value) -> Result<(), String> {
             .map_err(|e| format!("Failed to read target file {:?}: {}", path, e))?;
 
         edits.sort_by(|a, b| {
-            b.start_line.cmp(&a.start_line)
+            b.start_line
+                .cmp(&a.start_line)
                 .then_with(|| b.start_char.cmp(&a.start_char))
         });
 
@@ -1702,8 +2199,8 @@ fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Resu
     let end_byte = utf16_char_to_utf8_byte_offset_main(lines[edit.end_line], edit.end_char)?;
 
     let mut new_content = String::new();
-    for i in 0..edit.start_line {
-        new_content.push_str(lines[i]);
+    for line in lines.iter().take(edit.start_line) {
+        new_content.push_str(line);
         new_content.push('\n');
     }
 
@@ -1714,16 +2211,19 @@ fn apply_local_edit_to_string(content: &mut String, edit: LocalTextEdit) -> Resu
     let end_line_str = lines[edit.end_line];
     new_content.push_str(&end_line_str[end_byte..]);
 
-    for i in (edit.end_line + 1)..lines.len() {
+    for line in lines.iter().skip(edit.end_line + 1) {
         new_content.push('\n');
-        new_content.push_str(lines[i]);
+        new_content.push_str(line);
     }
 
     *content = new_content;
     Ok(())
 }
 
-fn utf16_char_to_utf8_byte_offset_main(line: &str, utf16_char_offset: usize) -> Result<usize, String> {
+fn utf16_char_to_utf8_byte_offset_main(
+    line: &str,
+    utf16_char_offset: usize,
+) -> Result<usize, String> {
     let mut utf16_count = 0;
     let mut byte_count = 0;
 
@@ -1821,7 +2321,8 @@ async fn lsp_shutdown(language: String, state: State<'_, AppState>) -> Result<()
         let mut clients = state.lsp_clients.lock().unwrap();
         let map = clients.as_mut().ok_or("LSP clients map not initialized")?;
         let global_ws = state.workspace_root.lock().unwrap().clone();
-        map.remove(&(global_ws, language)).ok_or("LSP server not running")?
+        map.remove(&(global_ws, language))
+            .ok_or("LSP server not running")?
     };
 
     client.shutdown().await
@@ -2331,4 +2832,70 @@ fn main() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::SystemTime;
+
+    fn get_temp_test_dir() -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        let duration = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        path.push(format!("antigravity_test_{}", duration));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_coordinates_parsing() {
+        let workspace = get_temp_test_dir();
+
+        let mock_file = workspace.join("mock_file.rs");
+        std::fs::write(&mock_file, "fn main() {}").unwrap();
+
+        // Windows drive letters format
+        let raw_path = mock_file.to_string_lossy().to_string();
+        let word = format!("{}:12:34", raw_path);
+        let parsed = parse_error_coordinates(&word, &workspace).unwrap();
+        assert_eq!(parsed.file_path, mock_file);
+        assert_eq!(parsed.line, 12);
+        assert_eq!(parsed.column, 34);
+
+        // TS/JS paren coordinate format
+        let ts_word = format!("{}(10,5)", raw_path);
+        let ts_parsed = parse_error_coordinates(&ts_word, &workspace).unwrap();
+        assert_eq!(ts_parsed.file_path, mock_file);
+        assert_eq!(ts_parsed.line, 10);
+        assert_eq!(ts_parsed.column, 5);
+
+        let _ = std::fs::remove_dir_all(&workspace);
+    }
+
+    #[test]
+    fn test_import_positioning() {
+        // Rust with inner attribute and comments
+        let mut source = "#![allow(dead_code)]\n// Some module comment\nfn hello() {}".to_string();
+        let new_imports = "use std::collections::HashMap;\n";
+        insert_imports_to_source(&mut source, new_imports, "rust");
+        assert!(source.starts_with("#![allow(dead_code)]"));
+        assert!(source.contains("use std::collections::HashMap;\nfn hello()"));
+
+        // Rust standard no attributes
+        let mut source_std = "fn main() {}".to_string();
+        insert_imports_to_source(&mut source_std, new_imports, "rust");
+        assert!(source_std.starts_with("use std::collections::HashMap;\nfn main()"));
+    }
+
+    #[test]
+    fn test_syntax_validation() {
+        let valid_code = "fn main() {\n    let x = 42;\n}";
+        assert!(validate_patch_syntax(valid_code, "rust"));
+
+        let invalid_code = "fn main() {\n    let x = ;\n}";
+        assert!(!validate_patch_syntax(invalid_code, "rust"));
+    }
 }
