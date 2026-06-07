@@ -40,10 +40,11 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         let logs_buffer = std::sync::Arc::new(logger::TelemetryBuffer::new(1000));
+        let default_ws = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| String::new());
         AppState {
-            workspace_root: std::sync::Arc::new(Mutex::new(
-                "D:\\Project\\Antigravity SDK".to_string(),
-            )),
+            workspace_root: std::sync::Arc::new(Mutex::new(default_ws)),
             llm_provider: std::sync::Arc::new(Mutex::new("gemini".to_string())),
             llm_endpoint: std::sync::Arc::new(Mutex::new(None)),
             llm_model: std::sync::Arc::new(Mutex::new(None)),
