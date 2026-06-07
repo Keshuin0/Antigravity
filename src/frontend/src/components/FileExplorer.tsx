@@ -22,7 +22,13 @@ interface TreeNodeProps {
   onFileAttach?: ((filePath: string) => void) | undefined;
 }
 
-const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeFilePath, onFileAttach }) => {
+const TreeNode: React.FC<TreeNodeProps> = ({
+  entry,
+  depth,
+  onFileSelect,
+  activeFilePath,
+  onFileAttach,
+}) => {
   const [isOpen, setIsOpen] = useState(false);
   const [children, setChildren] = useState<VfsEntry[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -69,7 +75,9 @@ const TreeNode: React.FC<TreeNodeProps> = ({ entry, depth, onFileSelect, activeF
 
         {/* Folder Arrow */}
         {entry.is_dir ? (
-          <span className={`mr-1.5 transition-transform duration-200 ${isOpen ? 'rotate-90' : 'rotate-0'}`}>
+          <span
+            className={`mr-1.5 transition-transform duration-200 ${isOpen ? 'rotate-90' : 'rotate-0'}`}
+          >
             <svg className="w-3.5 h-3.5 fill-current text-neutral-400" viewBox="0 0 24 24">
               <path d="M8.59 16.59L13.17 12 8.59 7.41 10 6l6 6-6 6-1.41-1.41z" />
             </svg>
@@ -204,7 +212,9 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
           onClick={async () => {
             setLoading(true);
             try {
-              const res = await invoke<VfsEntry[]>('read_workspace_dir_cmd', { path: workspaceRoot });
+              const res = await invoke<VfsEntry[]>('read_workspace_dir_cmd', {
+                path: workspaceRoot,
+              });
               setRootEntries(res);
             } catch (err) {
               setError(String(err));
@@ -234,8 +244,18 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
           </div>
         ) : rootEntries.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 px-4 text-center">
-            <svg className="w-8 h-8 text-neutral-600 mb-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+            <svg
+              className="w-8 h-8 text-neutral-600 mb-2"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
+              />
             </svg>
             <span className="text-neutral-500 text-xs">Empty or invalid workspace directory</span>
           </div>

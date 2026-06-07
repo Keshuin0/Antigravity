@@ -282,7 +282,8 @@ mod tests {
 
     #[test]
     fn test_openai_key_redaction() {
-        let input = "Connecting to OpenAI with token sk-proj-1234abcd5678efgh9012ijklmnop3456... success";
+        let input =
+            "Connecting to OpenAI with token sk-proj-1234abcd5678efgh9012ijklmnop3456... success";
         let expected = "Connecting to OpenAI with token [REDACTED]... success";
         assert_eq!(redact_secrets(input), expected);
     }

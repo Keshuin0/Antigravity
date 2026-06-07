@@ -1,5 +1,5 @@
 import React, { useEffect, useRef } from 'react';
-import Editor, { Monaco } from '@monaco-editor/react';
+import Editor, { DiffEditor, Monaco } from '@monaco-editor/react';
 import { invoke } from '@tauri-apps/api/core';
 import type { editor } from 'monaco-editor';
 
@@ -123,6 +123,8 @@ interface MonacoEditorProps {
   onContentChange: (newContent: string) => void;
   onSave: () => void;
   diagnostics: Record<string, LspDiagnostic[]>;
+  diffMode?: boolean;
+  originalContent?: string;
 }
 
 const isTauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -161,7 +163,12 @@ const getLanguageFromExtension = (path: string): string => {
   }
 };
 
-type StandaloneCodeEditor = Parameters<NonNullable<React.ComponentProps<typeof Editor>['onMount']>>[0];
+type StandaloneCodeEditor = Parameters<
+  NonNullable<React.ComponentProps<typeof Editor>['onMount']>
+>[0];
+type StandaloneDiffEditor = Parameters<
+  NonNullable<React.ComponentProps<typeof DiffEditor>['onMount']>
+>[0];
 
 export const MonacoEditor: React.FC<MonacoEditorProps> = ({
   filePath,
@@ -169,10 +176,18 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
   onContentChange,
   onSave,
   diagnostics,
+  diffMode = false,
+  originalContent = '',
 }) => {
   const editorRef = useRef<StandaloneCodeEditor | null>(null);
+  const diffEditorRef = useRef<StandaloneDiffEditor | null>(null);
   const monacoRef = useRef<Monaco | null>(null);
   const disposablesRef = useRef<{ dispose: () => void }[]>([]);
+
+  const handleDiffEditorDidMount = (editor: StandaloneDiffEditor, monaco: Monaco) => {
+    diffEditorRef.current = editor;
+    monaco.editor.setTheme('antigravity-telemetry');
+  };
 
   // Cleanup Monaco LSP Providers on Unmount
   const clearLspProviders = () => {
@@ -311,16 +326,18 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
                 }
 
                 if (item.documentation !== undefined) {
-                  const doc = typeof item.documentation === 'string'
-                    ? item.documentation
-                    : item.documentation?.value;
+                  const doc =
+                    typeof item.documentation === 'string'
+                      ? item.documentation
+                      : item.documentation?.value;
                   if (doc !== undefined) {
                     suggestion.documentation = doc;
                   }
                 }
 
                 if (item.insertTextFormat === 2) {
-                  suggestion.insertTextRules = monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
+                  suggestion.insertTextRules =
+                    monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet;
                 }
 
                 return suggestion;
@@ -407,20 +424,22 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
               if (!response) return null;
 
               const locations = Array.isArray(response) ? response : [response];
-              return locations.map((loc: LspLocationInfo) => {
-                const targetUri = loc.uri || loc.targetUri || '';
-                const range = loc.range || loc.targetSelectionRange;
-                if (!range) return null;
-                return {
-                  uri: monaco.Uri.parse(targetUri),
-                  range: {
-                    startLineNumber: range.start.line + 1,
-                    startColumn: range.start.character + 1,
-                    endLineNumber: range.end.line + 1,
-                    endColumn: range.end.character + 1,
-                  },
-                };
-              }).filter(Boolean) as import('monaco-editor').languages.Location[];
+              return locations
+                .map((loc: LspLocationInfo) => {
+                  const targetUri = loc.uri || loc.targetUri || '';
+                  const range = loc.range || loc.targetSelectionRange;
+                  if (!range) return null;
+                  return {
+                    uri: monaco.Uri.parse(targetUri),
+                    range: {
+                      startLineNumber: range.start.line + 1,
+                      startColumn: range.start.character + 1,
+                      endLineNumber: range.end.line + 1,
+                      endColumn: range.end.character + 1,
+                    },
+                  };
+                })
+                .filter(Boolean) as import('monaco-editor').languages.Location[];
             } catch (e) {
               console.warn(`LSP Definition failed for ${lang}:`, e);
               return null;
@@ -584,7 +603,7 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
               });
 
               if (response === null) {
-                throw new Error("Cannot rename this element");
+                throw new Error('Cannot rename this element');
               }
 
               let range: LspRange | undefined;
@@ -606,12 +625,14 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
                     endLineNumber: range.end.line + 1,
                     endColumn: range.end.character + 1,
                   },
-                  text: placeholder || model.getValueInRange({
-                    startLineNumber: range.start.line + 1,
-                    startColumn: range.start.character + 1,
-                    endLineNumber: range.end.line + 1,
-                    endColumn: range.end.character + 1,
-                  }),
+                  text:
+                    placeholder ||
+                    model.getValueInRange({
+                      startLineNumber: range.start.line + 1,
+                      startColumn: range.start.character + 1,
+                      endLineNumber: range.end.line + 1,
+                      endColumn: range.end.character + 1,
+                    }),
                 };
               }
             } catch (e) {
@@ -815,7 +836,10 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
     if (lang) {
       for (const change of ev.changes) {
         const lspRange = {
-          start: { line: change.range.startLineNumber - 1, character: change.range.startColumn - 1 },
+          start: {
+            line: change.range.startLineNumber - 1,
+            character: change.range.startColumn - 1,
+          },
           end: { line: change.range.endLineNumber - 1, character: change.range.endColumn - 1 },
         };
         invoke('lsp_file_change', {
@@ -837,51 +861,90 @@ export const MonacoEditor: React.FC<MonacoEditorProps> = ({
         <svg className="w-3.5 h-3.5 mr-2 text-cyan-400 fill-current" viewBox="0 0 24 24">
           <path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
         </svg>
-        <span className="truncate">{filePath}</span>
+        <span className="truncate">
+          {filePath}{' '}
+          {diffMode && (
+            <span className="text-[10px] text-amber-400 ml-1.5">(side-by-side staged diff)</span>
+          )}
+        </span>
       </div>
 
       {/* Monaco Core */}
       <div className="flex-1 w-full relative">
-        <Editor
-          height="100%"
-          language={language}
-          value={content}
-          onChange={handleChange}
-          onMount={handleEditorDidMount}
-          options={{
-            fontSize: 14,
-            fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
-            fontLigatures: true,
-            minimap: { enabled: true, side: 'right' },
-            scrollbar: {
-              vertical: 'visible',
-              horizontal: 'visible',
-              useShadows: false,
-              verticalHasArrows: false,
-              horizontalHasArrows: false,
-              verticalScrollbarSize: 10,
-              horizontalScrollbarSize: 10,
-            },
-            cursorBlinking: 'smooth',
-            cursorSmoothCaretAnimation: 'on',
-            lineNumbers: 'on',
-            renderWhitespace: 'selection',
-            tabSize: 4,
-            insertSpaces: true,
-            automaticLayout: true,
-            padding: { top: 8, bottom: 8 },
-            wordWrap: 'on',
-            smoothScrolling: true,
-            mouseWheelZoom: true,
-            formatOnType: true,
-            formatOnPaste: true,
-          }}
-          loading={
-            <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-cyan-400/80 text-sm font-semibold tracking-wider animate-pulse">
-              BOOTING MONACO LANGUAGE CONTEXT...
-            </div>
-          }
-        />
+        {diffMode ? (
+          <DiffEditor
+            height="100%"
+            language={language}
+            original={originalContent}
+            modified={content}
+            onMount={handleDiffEditorDidMount}
+            options={{
+              readOnly: true,
+              fontSize: 14,
+              fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+              fontLigatures: true,
+              minimap: { enabled: true },
+              scrollbar: {
+                vertical: 'visible',
+                horizontal: 'visible',
+                useShadows: false,
+                verticalScrollbarSize: 10,
+                horizontalScrollbarSize: 10,
+              },
+              cursorBlinking: 'smooth',
+              lineNumbers: 'on',
+              automaticLayout: true,
+              wordWrap: 'on',
+              smoothScrolling: true,
+            }}
+            loading={
+              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-cyan-400/80 text-sm font-semibold tracking-wider animate-pulse">
+                LOADING SIDE-BY-SIDE DIFF...
+              </div>
+            }
+          />
+        ) : (
+          <Editor
+            height="100%"
+            language={language}
+            value={content}
+            onChange={handleChange}
+            onMount={handleEditorDidMount}
+            options={{
+              fontSize: 14,
+              fontFamily: 'JetBrains Mono, Menlo, Monaco, Consolas, monospace',
+              fontLigatures: true,
+              minimap: { enabled: true, side: 'right' },
+              scrollbar: {
+                vertical: 'visible',
+                horizontal: 'visible',
+                useShadows: false,
+                verticalHasArrows: false,
+                horizontalHasArrows: false,
+                verticalScrollbarSize: 10,
+                horizontalScrollbarSize: 10,
+              },
+              cursorBlinking: 'smooth',
+              cursorSmoothCaretAnimation: 'on',
+              lineNumbers: 'on',
+              renderWhitespace: 'selection',
+              tabSize: 4,
+              insertSpaces: true,
+              automaticLayout: true,
+              padding: { top: 8, bottom: 8 },
+              wordWrap: 'on',
+              smoothScrolling: true,
+              mouseWheelZoom: true,
+              formatOnType: true,
+              formatOnPaste: true,
+            }}
+            loading={
+              <div className="absolute inset-0 flex items-center justify-center bg-[#090d13] text-cyan-400/80 text-sm font-semibold tracking-wider animate-pulse">
+                BOOTING MONACO LANGUAGE CONTEXT...
+              </div>
+            }
+          />
+        )}
       </div>
     </div>
   );
