@@ -681,6 +681,11 @@ async fn run_process_and_stream(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn process: {}", e))?;
@@ -2913,8 +2918,52 @@ async fn discover_models(
         .await
         .map_err(|e| format!("Failed to parse models JSON: {}", e))?;
 
-    let models = result.data.into_iter().map(|m| m.id).collect();
+    let mut models: Vec<String> = result.data.into_iter().map(|m| m.id).collect();
+    if endpoint.contains("nvidia.com") {
+        models.sort_by_key(|m| std::cmp::Reverse(score_nvidia_model(m)));
+    }
     Ok(models)
+}
+
+fn score_nvidia_model(model_id: &str) -> i32 {
+    let lower = model_id.to_lowercase();
+    if lower.contains("llama-3.3-70b") {
+        return 100;
+    }
+    if lower.contains("nemotron-51b") {
+        return 99;
+    }
+    if lower.contains("llama-3.1-405b") {
+        return 98;
+    }
+    if lower.contains("mistral-large") {
+        return 97;
+    }
+    if lower.contains("llama-3.1-70b") {
+        return 90;
+    }
+    if lower.contains("mixtral-8x22b") {
+        return 85;
+    }
+    if lower.contains("deepseek-coder") {
+        return 80;
+    }
+    if lower.contains("gemma-2-27b") {
+        return 75;
+    }
+    if lower.contains("gemma-2-9b") {
+        return 60;
+    }
+    if lower.contains("llama-3.1-8b") {
+        return 50;
+    }
+    if lower.contains("nemotron") {
+        return 40;
+    }
+    if lower.contains("phi-3") {
+        return 30;
+    }
+    0
 }
 
 fn sniff_mime_type_helper(bytes: &[u8], extension: &str) -> String {

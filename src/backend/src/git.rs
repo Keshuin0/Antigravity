@@ -263,10 +263,14 @@ pub fn git_get_file_at_head(repo_path: &str, file_path: &str) -> Result<String, 
 
 fn get_git_executable() -> String {
     // 1. Check if git is available on PATH
-    if std::process::Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok()
+    let mut check_cmd = std::process::Command::new("git");
+    check_cmd.arg("--version");
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        check_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    if check_cmd.output().is_ok()
     {
         return "git".to_string();
     }
@@ -311,9 +315,16 @@ pub fn git_push(path: &str) -> Result<(), String> {
 
     // Run system command `git push origin <branch>` synchronously
     let git_exe = get_git_executable();
-    let output = std::process::Command::new(git_exe)
+    let mut push_cmd = std::process::Command::new(git_exe);
+    push_cmd
         .args(["push", "origin", &branch])
-        .current_dir(path)
+        .current_dir(path);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        push_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+    let output = push_cmd
         .output()
         .map_err(|e| format!("Failed to execute git push: {}", e))?;
 
