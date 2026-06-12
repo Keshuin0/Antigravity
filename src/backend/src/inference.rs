@@ -300,26 +300,96 @@ pub async fn stream_generate_content_multiplexed(
                 endpoint_url.push_str("/chat/completions");
             }
         }
-        let model_name = model.unwrap_or("nvidia/llama-3.1-inst-70b");
 
-        let payload = OpenAIChatRequest {
-            model: model_name.to_string(),
-            messages: vec![OpenAIChatMessage {
-                role: "user".to_string(),
-                content: serde_json::json!(openai_contents),
-            }],
-            stream: true,
-        };
+        let is_nvidia = endpoint_url.contains("nvidia.com");
+        let mut candidate_models = Vec::new();
 
-        let mut req = client.post(endpoint_url);
-        if !key_str.trim().is_empty() {
-            req = req.bearer_auth(key_str);
+        if is_nvidia {
+            let base_ep = endpoint.unwrap_or("https://integrate.api.nvidia.com/v1");
+            let available = get_nvidia_available_models(base_ep, key_str).await;
+
+            // 1. User selected model
+            if let Some(user_model) = model {
+                if available.contains(&user_model.to_string()) {
+                    candidate_models.push(user_model.to_string());
+                }
+            }
+
+            // 2. Preferred models for the prompt/role
+            let preferred = get_nvidia_models_for_prompt(prompt);
+            for m in preferred {
+                let m_str = m.to_string();
+                if available.contains(&m_str) && !candidate_models.contains(&m_str) {
+                    candidate_models.push(m_str);
+                }
+            }
+
+            // 3. Fallback: remaining available models
+            for m in &available {
+                if !candidate_models.contains(m) {
+                    candidate_models.push(m.clone());
+                }
+            }
         }
 
-        req.json(&payload)
-            .send()
-            .await
-            .map_err(|e| format!("Network request failed: {}", e))?
+        if candidate_models.is_empty() {
+            let default_model = model.unwrap_or("nvidia/llama-3.1-inst-70b").to_string();
+            candidate_models.push(default_model);
+        }
+
+        let mut last_error = String::new();
+        let mut response_opt = None;
+        let mut used_model_name = String::new();
+
+        for model_name in &candidate_models {
+            tracing::info!("NVIDIA/OpenAI: Attempting inference using model: {}", model_name);
+
+            let payload = OpenAIChatRequest {
+                model: model_name.clone(),
+                messages: vec![OpenAIChatMessage {
+                    role: "user".to_string(),
+                    content: serde_json::json!(openai_contents),
+                }],
+                stream: true,
+            };
+
+            let mut req = client.post(&endpoint_url);
+            if !key_str.trim().is_empty() {
+                req = req.bearer_auth(key_str);
+            }
+
+            match req.json(&payload).send().await {
+                Ok(res) => {
+                    let status = res.status();
+                    if status.is_success() {
+                        response_opt = Some(res);
+                        used_model_name = model_name.clone();
+                        break;
+                    } else {
+                        let err_text = res.text().await.unwrap_or_default();
+                        last_error = format!("Model {} failed ({}): {}", model_name, status, err_text);
+                        tracing::warn!("{}", last_error);
+                    }
+                }
+                Err(e) => {
+                    last_error = format!("Model {} network failure: {}", model_name, e);
+                    tracing::warn!("{}", last_error);
+                }
+            }
+        }
+
+        match response_opt {
+            Some(res) => {
+                tracing::info!("NVIDIA/OpenAI: Successfully routed to model: {}", used_model_name);
+                res
+            }
+            None => {
+                return Err(format!(
+                    "All candidate models failed on NVIDIA/OpenAI endpoint. Last error: {}",
+                    last_error
+                ));
+            }
+        }
     };
 
     let status = response.status();
@@ -492,6 +562,104 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
     general_purpose::STANDARD
         .decode(s)
         .map_err(|e| e.to_string())
+}
+
+static NVIDIA_MODELS_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+
+async fn get_nvidia_available_models(endpoint: &str, api_key: &str) -> Vec<String> {
+    let cache = NVIDIA_MODELS_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
+    {
+        let guard = cache.lock().unwrap();
+        if !guard.is_empty() {
+            return guard.clone();
+        }
+    }
+
+    // Cache is empty, let's fetch it
+    let mut base_url = endpoint.to_string();
+    if base_url.ends_with("/chat/completions") {
+        base_url = base_url.replace("/chat/completions", "");
+    }
+    if base_url.ends_with("/embeddings") {
+        base_url = base_url.replace("/embeddings", "");
+    }
+    if !base_url.ends_with('/') {
+        base_url.push('/');
+    }
+    let models_url = if base_url.ends_with("/v1/") {
+        format!("{}models", base_url)
+    } else {
+        format!("{}v1/models", base_url)
+    };
+
+    let client = crate::embeddings::build_http_client(false);
+    let mut req = client.get(&models_url);
+    if !api_key.trim().is_empty() {
+        req = req.bearer_auth(api_key);
+    }
+
+    if let Ok(res) = req.send().await {
+        if res.status().is_success() {
+            #[derive(Deserialize)]
+            struct ModelItem {
+                id: String,
+            }
+            #[derive(Deserialize)]
+            struct ModelsResponse {
+                data: Vec<ModelItem>,
+            }
+            if let Ok(result) = res.json::<ModelsResponse>().await {
+                let models: Vec<String> = result.data.into_iter().map(|m| m.id).collect();
+                let mut guard = cache.lock().unwrap();
+                *guard = models.clone();
+                return models;
+            }
+        }
+    }
+
+    Vec::new()
+}
+
+fn get_nvidia_models_for_prompt(prompt: &str) -> Vec<&'static str> {
+    if prompt.contains("Swarm Planner") {
+        vec![
+            "meta/llama-3.3-70b-instruct",
+            "nvidia/llama-3.1-nemotron-51b-instruct",
+            "meta/llama-3.1-405b-instruct",
+            "mistralai/mistral-large-2-instruct",
+            "meta/llama-3.1-70b-instruct",
+        ]
+    } else if prompt.contains("Architect") {
+        vec![
+            "meta/llama-3.3-70b-instruct",
+            "nvidia/llama-3.1-nemotron-51b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "mistralai/mistral-large-2-instruct",
+        ]
+    } else if prompt.contains("Frontend") || prompt.contains("Backend") {
+        vec![
+            "deepseek-ai/deepseek-coder-7b-instruct-v1.5",
+            "meta/llama-3.3-70b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "nvidia/llama-3.1-nemotron-51b-instruct",
+        ]
+    } else if prompt.contains("QA") {
+        vec![
+            "meta/llama-3.1-8b-instruct",
+            "google/gemma-2-9b-it",
+            "google/gemma-2-27b-it",
+            "nvidia/nemotron-mini-4b-instruct",
+            "meta/llama-3.3-70b-instruct",
+        ]
+    } else {
+        // General Chat / Default
+        vec![
+            "meta/llama-3.3-70b-instruct",
+            "nvidia/llama-3.1-nemotron-51b-instruct",
+            "meta/llama-3.1-70b-instruct",
+            "meta/llama-3.1-8b-instruct",
+        ]
+    }
 }
 
 #[cfg(test)]

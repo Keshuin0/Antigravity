@@ -63,16 +63,24 @@ fn resolve_typescript_server_path(_app_handle: &AppHandle) -> Result<PathBuf, St
         PathBuf::from("npm")
     };
 
-    let mut child = std::process::Command::new(&npm_bin)
-        .args([
-            "install",
-            "--prefix",
-            &local_servers_dir.to_string_lossy(),
-            "typescript-language-server",
-            "typescript",
-        ])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+    let mut cmd = std::process::Command::new(&npm_bin);
+    cmd.args([
+        "install",
+        "--prefix",
+        &local_servers_dir.to_string_lossy(),
+        "typescript-language-server",
+        "typescript",
+    ])
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn npm installer: {}", e))?;
 
@@ -221,6 +229,11 @@ impl LspClient {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+
+        #[cfg(target_os = "windows")]
+        {
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
 
         // log startup attempt
         tracing::info!(
