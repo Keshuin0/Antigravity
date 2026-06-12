@@ -270,8 +270,7 @@ fn get_git_executable() -> String {
         use std::os::windows::process::CommandExt;
         check_cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
     }
-    if check_cmd.output().is_ok()
-    {
+    if check_cmd.output().is_ok() {
         return "git".to_string();
     }
 
@@ -316,9 +315,7 @@ pub fn git_push(path: &str) -> Result<(), String> {
     // Run system command `git push origin <branch>` synchronously
     let git_exe = get_git_executable();
     let mut push_cmd = std::process::Command::new(git_exe);
-    push_cmd
-        .args(["push", "origin", &branch])
-        .current_dir(path);
+    push_cmd.args(["push", "origin", &branch]).current_dir(path);
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;

@@ -1381,6 +1381,7 @@ async fn self_healing_loop(
 
             if current_is_temp {
                 let mut fallback_branch = None;
+                #[allow(clippy::manual_flatten)]
                 if let Ok(branches) = repo.branches(Some(git2::BranchType::Local)) {
                     for b_res in branches {
                         if let Ok((b, _)) = b_res {
@@ -3233,7 +3234,7 @@ enum AssistantAction {
 fn parse_actions(text: &str) -> Vec<AssistantAction> {
     let mut actions = Vec::new();
     let mut lines = text.lines().peekable();
-    
+
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
         if trimmed.starts_with("```write-file") {
@@ -3247,7 +3248,7 @@ fn parse_actions(text: &str) -> Vec<AssistantAction> {
             } else {
                 "file.txt".to_string()
             };
-            
+
             let mut content = String::new();
             while let Some(next_line) = lines.peek() {
                 if next_line.trim().starts_with("```") {
@@ -3270,7 +3271,9 @@ fn parse_actions(text: &str) -> Vec<AssistantAction> {
                 command.push('\n');
                 lines.next();
             }
-            actions.push(AssistantAction::RunCommand { command: command.trim().to_string() });
+            actions.push(AssistantAction::RunCommand {
+                command: command.trim().to_string(),
+            });
         } else if trimmed.starts_with("```read-file") {
             let path = if let Some(start_idx) = trimmed.find("path=\"") {
                 let sub = &trimmed[start_idx + 6..];
@@ -3292,7 +3295,7 @@ fn parse_actions(text: &str) -> Vec<AssistantAction> {
             actions.push(AssistantAction::ReadFile { path });
         }
     }
-    
+
     actions
 }
 
@@ -3314,11 +3317,14 @@ fn resolve_safe_path(workspace: &str, relative_path: &str) -> Result<std::path::
             }
         }
     }
-    
+
     if normalized.starts_with(base) {
         Ok(normalized)
     } else {
-        Err(format!("Access denied: path '{}' escapes workspace root", relative_path))
+        Err(format!(
+            "Access denied: path '{}' escapes workspace root",
+            relative_path
+        ))
     }
 }
 
@@ -3335,7 +3341,8 @@ async fn execute_assistant_actions(
                     action: "write-file".to_string(),
                     detail: format!("Writing file: {}", path),
                 };
-                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+                let _ =
+                    channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
 
                 if let Some(parent) = resolved.parent() {
                     let _ = std::fs::create_dir_all(parent);
@@ -3370,13 +3377,12 @@ async fn execute_assistant_actions(
                     action: "read-file".to_string(),
                     detail: format!("Reading file: {}", path),
                 };
-                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+                let _ =
+                    channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
 
                 let success = match std::fs::read_to_string(&resolved) {
                     Ok(content) => {
-                        let log_event = AssistantEvent::ActionLog {
-                            content,
-                        };
+                        let log_event = AssistantEvent::ActionLog { content };
                         let _ = channel.send(serde_json::to_string(&log_event).unwrap());
                         true
                     }
@@ -3400,7 +3406,8 @@ async fn execute_assistant_actions(
                     action: "run-command".to_string(),
                     detail: format!("Running command: {}", command),
                 };
-                let _ = channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
+                let _ =
+                    channel.send(serde_json::to_string(&start_event).map_err(|e| e.to_string())?);
 
                 let parsed = parse_command_string(&command);
                 let success = if let Some((program, args)) = parsed {
@@ -3699,7 +3706,10 @@ async fn execute_swarm_agent_actions(
                             };
                             let _ = channel.send(serde_json::to_string(&log_event).unwrap());
                             if exit_code != 0 {
-                                return Err(format!("Process failed with exit code: {}", exit_code));
+                                return Err(format!(
+                                    "Process failed with exit code: {}",
+                                    exit_code
+                                ));
                             }
                         }
                         Err(e) => {
@@ -3725,6 +3735,7 @@ async fn execute_swarm_agent_actions(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_agent_task(
     agent_id: &str,
     role: &str,
@@ -3796,7 +3807,7 @@ async fn run_agent_task(
     if !actions.is_empty() {
         execute_swarm_agent_actions(actions, agent_id, workspace, channel).await?;
     }
-    
+
     Ok(())
 }
 
@@ -3919,12 +3930,15 @@ async fn run_swarm_orchestrator(
     while let Some(token) = api_rx.recv().await {
         planner_res.push_str(&token);
     }
-    
+
     let cleaned_res = clean_json_response(&planner_res);
     let mut tasks: Vec<SwarmTask> = match serde_json::from_str(&cleaned_res) {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!("Swarm Planner returned invalid JSON: {}, fallback to basic plan", e);
+            tracing::warn!(
+                "Swarm Planner returned invalid JSON: {}, fallback to basic plan",
+                e
+            );
             vec![
                 SwarmTask {
                     id: "task_1".to_string(),
@@ -3941,7 +3955,7 @@ async fn run_swarm_orchestrator(
                     description: "Verify that all changes are compiling and correct.".to_string(),
                     dependencies: vec!["task_1".to_string()],
                     status: "pending".to_string(),
-                }
+                },
             ]
         }
     };
@@ -3950,7 +3964,9 @@ async fn run_swarm_orchestrator(
         task.status = "pending".to_string();
     }
 
-    let start_event = SwarmEvent::SwarmStart { plan: tasks.clone() };
+    let start_event = SwarmEvent::SwarmStart {
+        plan: tasks.clone(),
+    };
     let _ = channel.send(serde_json::to_string(&start_event).unwrap());
 
     let tasks_state = std::sync::Arc::new(tokio::sync::Mutex::new(tasks));
@@ -3958,13 +3974,13 @@ async fn run_swarm_orchestrator(
 
     loop {
         let mut active_futures = Vec::new();
-        
+
         {
             let mut tasks_lock = tasks_state.lock().await;
-            
+
             let all_done = tasks_lock.iter().all(|t| t.status == "completed");
             let any_failed = tasks_lock.iter().any(|t| t.status == "failed");
-            
+
             if any_failed {
                 swarm_success = false;
                 break;
@@ -3972,7 +3988,7 @@ async fn run_swarm_orchestrator(
             if all_done {
                 break;
             }
-            
+
             let completed_ids: std::collections::HashSet<String> = tasks_lock
                 .iter()
                 .filter(|t| t.status == "completed")
@@ -3981,10 +3997,11 @@ async fn run_swarm_orchestrator(
 
             for task in tasks_lock.iter_mut() {
                 if task.status == "pending" {
-                    let deps_satisfied = task.dependencies.iter().all(|dep_id| {
-                        completed_ids.contains(dep_id)
-                    });
-                    
+                    let deps_satisfied = task
+                        .dependencies
+                        .iter()
+                        .all(|dep_id| completed_ids.contains(dep_id));
+
                     if deps_satisfied {
                         task.status = "running".to_string();
                         let status_event = SwarmEvent::AgentStatus {
@@ -3994,12 +4011,12 @@ async fn run_swarm_orchestrator(
                             current_task: task.description.clone(),
                         };
                         let _ = channel.send(serde_json::to_string(&status_event).unwrap());
-                        
+
                         let task_id = task.id.clone();
                         let agent_id = task.agent_id.clone();
                         let role = task.role.clone();
                         let desc = task.description.clone();
-                        
+
                         let workspace_clone = workspace.clone();
                         let provider_clone = provider.clone();
                         let endpoint_clone = endpoint.clone();
@@ -4008,7 +4025,7 @@ async fn run_swarm_orchestrator(
                         let channel_clone = channel.clone();
                         let tasks_state_clone = tasks_state.clone();
                         let app_handle_clone = app_handle.clone();
-                        
+
                         let fut = tokio::spawn(async move {
                             let res = run_agent_task(
                                 &agent_id,
@@ -4021,8 +4038,9 @@ async fn run_swarm_orchestrator(
                                 &api_key_clone,
                                 &channel_clone,
                                 app_handle_clone,
-                            ).await;
-                            
+                            )
+                            .await;
+
                             let mut tasks_lock_inner = tasks_state_clone.lock().await;
                             if let Some(t) = tasks_lock_inner.iter_mut().find(|t| t.id == task_id) {
                                 if res.is_ok() {
@@ -4036,7 +4054,8 @@ async fn run_swarm_orchestrator(
                                     status: t.status.clone(),
                                     current_task: desc.clone(),
                                 };
-                                let _ = channel_clone.send(serde_json::to_string(&status_event).unwrap());
+                                let _ = channel_clone
+                                    .send(serde_json::to_string(&status_event).unwrap());
                             }
                         });
                         active_futures.push(fut);
@@ -4044,7 +4063,7 @@ async fn run_swarm_orchestrator(
                 }
             }
         }
-        
+
         if active_futures.is_empty() {
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         } else {
@@ -4054,7 +4073,9 @@ async fn run_swarm_orchestrator(
         }
     }
 
-    let end_event = SwarmEvent::SwarmEnd { success: swarm_success };
+    let end_event = SwarmEvent::SwarmEnd {
+        success: swarm_success,
+    };
     let _ = channel.send(serde_json::to_string(&end_event).unwrap());
     Ok(())
 }

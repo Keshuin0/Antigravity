@@ -342,7 +342,10 @@ pub async fn stream_generate_content_multiplexed(
         let mut used_model_name = String::new();
 
         for model_name in &candidate_models {
-            tracing::info!("NVIDIA/OpenAI: Attempting inference using model: {}", model_name);
+            tracing::info!(
+                "NVIDIA/OpenAI: Attempting inference using model: {}",
+                model_name
+            );
 
             let payload = OpenAIChatRequest {
                 model: model_name.clone(),
@@ -367,7 +370,8 @@ pub async fn stream_generate_content_multiplexed(
                         break;
                     } else {
                         let err_text = res.text().await.unwrap_or_default();
-                        last_error = format!("Model {} failed ({}): {}", model_name, status, err_text);
+                        last_error =
+                            format!("Model {} failed ({}): {}", model_name, status, err_text);
                         tracing::warn!("{}", last_error);
                     }
                 }
@@ -380,7 +384,10 @@ pub async fn stream_generate_content_multiplexed(
 
         match response_opt {
             Some(res) => {
-                tracing::info!("NVIDIA/OpenAI: Successfully routed to model: {}", used_model_name);
+                tracing::info!(
+                    "NVIDIA/OpenAI: Successfully routed to model: {}",
+                    used_model_name
+                );
                 res
             }
             None => {
@@ -564,7 +571,8 @@ fn base64_decode(s: &str) -> Result<Vec<u8>, String> {
         .map_err(|e| e.to_string())
 }
 
-static NVIDIA_MODELS_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+static NVIDIA_MODELS_CACHE: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> =
+    std::sync::OnceLock::new();
 
 async fn get_nvidia_available_models(endpoint: &str, api_key: &str) -> Vec<String> {
     let cache = NVIDIA_MODELS_CACHE.get_or_init(|| std::sync::Mutex::new(Vec::new()));
