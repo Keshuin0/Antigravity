@@ -120,6 +120,11 @@ pub async fn stream_generate_content_multiplexed(
     let start_time = std::time::Instant::now();
     let mut first_token_time: Option<std::time::Instant> = None;
     let mut token_count = 0;
+    let mut used_model_name = if provider == "gemini" {
+        "gemini-1.5-pro".to_string()
+    } else {
+        String::new()
+    };
 
     let client = if provider == "gemini" {
         crate::embeddings::build_http_client(false)
@@ -339,7 +344,7 @@ pub async fn stream_generate_content_multiplexed(
 
         let mut last_error = String::new();
         let mut response_opt = None;
-        let mut used_model_name = String::new();
+        used_model_name = String::new();
 
         for model_name in &candidate_models {
             tracing::info!(
@@ -490,10 +495,15 @@ pub async fn stream_generate_content_multiplexed(
     // Send a final log message to telemetry stream containing metrics
     if let Some(t_time) = first_token_time {
         let ttft = t_time.duration_since(start_time).as_secs_f64();
+        let model_info = if !used_model_name.is_empty() {
+            format!("Model: {} | ", used_model_name)
+        } else {
+            String::new()
+        };
         let _ = tx
             .send(format!(
-                "\n\n[Self-Healing Engine] [Telemetry] TTFT: {:.3}s | Speed: {:.2} tokens/sec",
-                ttft, tps
+                "\n\n[Self-Healing Engine] [Telemetry] {}TTFT: {:.3}s | Speed: {:.2} tokens/sec",
+                model_info, ttft, tps
             ))
             .await;
     }
