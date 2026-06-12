@@ -3007,6 +3007,15 @@ async fn open_file_dialog() -> Result<Option<String>, String> {
     Ok(file.map(|f| f.path().to_string_lossy().to_string()))
 }
 
+#[tauri::command]
+async fn open_dir_dialog() -> Result<Option<String>, String> {
+    let dir = rfd::AsyncFileDialog::new()
+        .set_title("Select Project Folder")
+        .pick_folder()
+        .await;
+    Ok(dir.map(|d| d.path().to_string_lossy().to_string()))
+}
+
 #[derive(serde::Serialize)]
 struct FileSniffResult {
     mime_type: String,
@@ -4202,6 +4211,7 @@ fn main() {
             extract_document_text,
             upload_file_to_gemini,
             open_file_dialog,
+            open_dir_dialog,
             run_chat_assistant,
             run_swarm_orchestrator
         ])

@@ -1492,6 +1492,7 @@ const App: React.FC = () => {
               onFileSelect={handleOpenFile}
               activeFilePath={activeFilePath}
               onFileAttach={handleFileAttach}
+              onWorkspaceRootChange={setWorkspaceRoot}
             />
           )}
 
@@ -1601,12 +1602,29 @@ const App: React.FC = () => {
                     <label className="text-[10px] font-semibold text-white/40 uppercase tracking-wider block">
                       Workspace Root
                     </label>
-                    <input
-                      type="text"
-                      value={workspaceRoot}
-                      onChange={(e) => setWorkspaceRoot(e.target.value)}
-                      className="w-full px-3 py-2 bg-black/40 border border-white/10 focus:border-primary/50 outline-none rounded-lg text-xs text-white font-mono"
-                    />
+                    <div className="flex space-x-2">
+                      <input
+                        type="text"
+                        value={workspaceRoot}
+                        onChange={(e) => setWorkspaceRoot(e.target.value)}
+                        className="flex-1 px-3 py-2 bg-black/40 border border-white/10 focus:border-primary/50 outline-none rounded-lg text-xs text-white font-mono"
+                      />
+                      <button
+                        onClick={async () => {
+                          try {
+                            const selected = await invoke<string | null>('open_dir_dialog');
+                            if (selected) {
+                              setWorkspaceRoot(selected);
+                            }
+                          } catch (err) {
+                            addLog('error', `Failed to open directory picker: ${err}`);
+                          }
+                        }}
+                        className="px-3 py-2 bg-white/5 hover:bg-white/10 text-white rounded-lg text-xs border border-white/10 active:scale-95 transition-all cursor-pointer font-sans"
+                      >
+                        Browse
+                      </button>
+                    </div>
                   </div>
 
                   <div className="space-y-1.5">
