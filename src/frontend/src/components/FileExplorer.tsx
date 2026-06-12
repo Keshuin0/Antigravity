@@ -12,6 +12,7 @@ interface FileExplorerProps {
   onFileSelect: (filePath: string) => void;
   activeFilePath: string | null;
   onFileAttach?: ((filePath: string) => void) | undefined;
+  onWorkspaceRootChange?: (path: string) => void;
 }
 
 interface TreeNodeProps {
@@ -165,6 +166,7 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
   onFileSelect,
   activeFilePath,
   onFileAttach,
+  onWorkspaceRootChange,
 }) => {
   const [rootEntries, setRootEntries] = useState<VfsEntry[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -208,27 +210,49 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
         <span className="text-xs font-bold uppercase tracking-widest text-neutral-400">
           Workspace Explorer
         </span>
-        <button
-          onClick={async () => {
-            setLoading(true);
-            try {
-              const res = await invoke<VfsEntry[]>('read_workspace_dir_cmd', {
-                path: workspaceRoot,
-              });
-              setRootEntries(res);
-            } catch (err) {
-              setError(String(err));
-            } finally {
-              setLoading(false);
-            }
-          }}
-          className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-primary transition-colors"
-          title="Refresh Workspace"
-        >
-          <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
-            <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
-          </svg>
-        </button>
+        <div className="flex items-center space-x-1.5">
+          {onWorkspaceRootChange && (
+            <button
+              onClick={async () => {
+                try {
+                  const selected = await invoke<string | null>('open_dir_dialog');
+                  if (selected) {
+                    onWorkspaceRootChange(selected);
+                  }
+                } catch (err) {
+                  console.error('Failed to open directory picker:', err);
+                }
+              }}
+              className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-primary transition-colors cursor-pointer"
+              title="Open Project Folder"
+            >
+              <svg className="w-3.5 h-3.5 fill-none stroke-current" viewBox="0 0 24 24" strokeWidth="2">
+                <path strokeLinecap="round" strokeLinejoin="round" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+              </svg>
+            </button>
+          )}
+          <button
+            onClick={async () => {
+              setLoading(true);
+              try {
+                const res = await invoke<VfsEntry[]>('read_workspace_dir_cmd', {
+                  path: workspaceRoot,
+                });
+                setRootEntries(res);
+              } catch (err) {
+                setError(String(err));
+              } finally {
+                setLoading(false);
+              }
+            }}
+            className="p-1 hover:bg-white/5 rounded text-neutral-400 hover:text-primary transition-colors cursor-pointer"
+            title="Refresh Workspace"
+          >
+            <svg className="w-3.5 h-3.5 fill-current" viewBox="0 0 24 24">
+              <path d="M17.65 6.35C16.2 4.9 14.21 4 12 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08c-.82 2.33-3.04 4-5.65 4-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z" />
+            </svg>
+          </button>
+        </div>
       </div>
 
       {/* Directory Tree */}
@@ -257,7 +281,24 @@ export const FileExplorer: React.FC<FileExplorerProps> = ({
                 d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z"
               />
             </svg>
-            <span className="text-neutral-500 text-xs">Empty or invalid workspace directory</span>
+            <span className="text-neutral-500 text-xs mb-3">Empty or invalid workspace directory</span>
+            {onWorkspaceRootChange && (
+              <button
+                onClick={async () => {
+                  try {
+                    const selected = await invoke<string | null>('open_dir_dialog');
+                    if (selected) {
+                      onWorkspaceRootChange(selected);
+                    }
+                  } catch (err) {
+                    console.error('Failed to open directory picker:', err);
+                  }
+                }}
+                className="px-3 py-1.5 bg-primary/15 hover:bg-primary/25 border border-primary/30 text-primary hover:text-white rounded-lg text-xs font-semibold active:scale-95 transition-all cursor-pointer font-sans"
+              >
+                Open Project Folder
+              </button>
+            )}
           </div>
         ) : (
           rootEntries.map((entry) => (

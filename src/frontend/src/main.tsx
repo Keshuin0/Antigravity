@@ -1492,6 +1492,7 @@ const App: React.FC = () => {
               onFileSelect={handleOpenFile}
               activeFilePath={activeFilePath}
               onFileAttach={handleFileAttach}
+              onWorkspaceRootChange={setWorkspaceRoot}
             />
           )}
 
